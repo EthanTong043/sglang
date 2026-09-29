@@ -768,6 +768,9 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    # 额外写入的 DFS 副本数（0=不写，1=写一份到挂载的并行文件系统）。
+    # 不设则 Mooncake 用 ReplicateConfig 默认值 0，DFS 永远不会被写入。
+    MOONCAKE_DFS_REPLICA_NUM = EnvInt(0)
 
     # ===================================================================
     # MoRI transport and expert dispatch

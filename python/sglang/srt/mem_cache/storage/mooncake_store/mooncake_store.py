@@ -105,6 +105,18 @@ class MooncakeStoreConfig:
     enable_ssd_offload: bool = False
     ssd_offload_path: Optional[str] = None
     tenant_id: str = DEFAULT_TENANT_ID
+    # 每个对象额外写入的 DFS（分布式文件系统）副本数。
+    #
+    # 0 = 不写 DFS，与改动前行为一致，也是 Mooncake C++ 侧
+    # ReplicateConfig 的默认值（replica.h:107）。
+    #
+    # 设为 1 时 KV 会同时写入 Mooncake 的 DRAM 段和挂载的并行文件系统
+    # （如 GPFS），后者作为跨实例共享的容量层。**不设则 DFS 永远不会
+    # 被写入** —— 因为不传 ReplicateConfig 时 C++ 侧用的是默认值 0。
+    #
+    # Mooncake 目前只支持 0 或 1（master_service.cpp 对 >1 返回
+    # INVALID_PARAMS），且要求 replica_num >= 1，默认值已满足。
+    dfs_replica_num: int = 0
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -164,6 +176,9 @@ class MooncakeStoreConfig:
             tenant_id=_normalize_tenant_id(
                 config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
             ),
+            dfs_replica_num=int(
+                config.get("dfs_replica_num", envs.MOONCAKE_DFS_REPLICA_NUM.default)
+            ),
         )
 
     @staticmethod
@@ -206,6 +221,7 @@ class MooncakeStoreConfig:
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
             tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
+            dfs_replica_num=envs.MOONCAKE_DFS_REPLICA_NUM.get(),
         )
 
     @staticmethod
@@ -257,6 +273,11 @@ class MooncakeStoreConfig:
             tenant_id=_normalize_tenant_id(
                 extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
             ),
+            dfs_replica_num=int(
+                extra_config.get(
+                    "dfs_replica_num", envs.MOONCAKE_DFS_REPLICA_NUM.default
+                )
+            ),
         )
 
 
@@ -290,6 +311,22 @@ class MooncakeBaseStore:
             except Exception:
                 supports_group_ids = False
         return ReplicateConfig, supports_group_ids
+
+    @staticmethod
+    def _supports_dfs_replica_num(replicate_config_cls) -> bool:
+        """探测安装的 Mooncake 是否暴露了 ReplicateConfig.dfs_replica_num。
+
+        与 group_ids 用同一套判断方式：先看类属性，pybind 的
+        def_readwrite 在某些版本上只在实例上可见，所以再退一步试实例。
+        """
+        if replicate_config_cls is None:
+            return False
+        if hasattr(replicate_config_cls, "dfs_replica_num"):
+            return True
+        try:
+            return hasattr(replicate_config_cls(), "dfs_replica_num")
+        except Exception:
+            return False
 
     def _load_config(self, storage_config: Any = None):
         extra_config = (
@@ -385,6 +422,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
         )
+        # 默认关闭。真正的判定在下面的 try 块里（需要先加载配置），
+        # 这里先给出确定值，避免构造中途抛异常时留下未定义属性。
+        self._use_dfs_replica = False
         try:
             self.store = MooncakeDistributedStore()
 
@@ -410,6 +450,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     "Mooncake package does not support ReplicateConfig.group_ids. "
                     "Falling back to the existing batch_put_from path."
                 )
+
+            # DFS 副本：配置要求写、且安装的 Mooncake 支持该字段时才启用。
+            #
+            # 与 group semantics 同样做能力探测 —— dfs_replica_num 是较新的
+            # pybind 绑定（store_py.cpp:2003），旧版本的 wheel 上不存在。
+            # 盲目 setattr 在旧版本上要么静默无效（pybind 对象通常禁止
+            # 动态属性，但不同版本行为不一），要么抛 AttributeError，
+            # 两种都不如显式探测 + 告警。
+            self._use_dfs_replica = False
+            if self.config.dfs_replica_num > 0:
+                if self._supports_dfs_replica_num(self._replicate_config_cls):
+                    self._use_dfs_replica = True
+                    logger.info(
+                        "Mooncake DFS replica enabled, dfs_replica_num=%d; "
+                        "KV pages will also be written to the mounted "
+                        "distributed filesystem",
+                        self.config.dfs_replica_num,
+                    )
+                else:
+                    # 不静默降级：用户显式要求写 DFS 却写不了，属于配置
+                    # 与运行环境不匹配。继续跑（只是没有 L4），但必须让
+                    # 人看到 —— 否则表现为"GPFS 目录一直是空的"而无从查起。
+                    logger.warning(
+                        "dfs_replica_num=%d was requested, but the installed "
+                        "Mooncake package does not expose "
+                        "ReplicateConfig.dfs_replica_num. KV will NOT be "
+                        "written to the distributed filesystem. Upgrade "
+                        "Mooncake to use the DFS capacity tier.",
+                        self.config.dfs_replica_num,
+                    )
             rank_scale_factor = (
                 1
                 if storage_config is None
@@ -1326,6 +1396,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+
+        # 需要写 DFS 副本时必须显式传 ReplicateConfig。
+        #
+        # 不传的话走的是 batch_put_from 的三参重载，C++ 侧用默认构造的
+        # ReplicateConfig，其 dfs_replica_num 为 0（replica.h:107）——
+        # 也就是说 **不做这一步，挂载的并行文件系统永远不会被写入**。
+        #
+        # 与上面的 group_ids 共用同一个 config 对象：两者都只是在配置上
+        # 设不同字段，没有互斥关系。
+        if self._use_dfs_replica:
+            config = config or self._replicate_config_cls()
+            config.dfs_replica_num = self.config.dfs_replica_num
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
