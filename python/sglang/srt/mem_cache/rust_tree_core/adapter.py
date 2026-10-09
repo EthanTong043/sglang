@@ -484,7 +484,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
-            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None
+            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None,
+            # 丢弃归因：Rust binding 目前未导出该字段，getattr 回退 None 表示
+            # 「本步不上报」，与 Python TreeCore 的语义一致（None = 非无备份丢弃）。
+            # 注意这意味着 rust backend 下 below_write_threshold /
+            # never_backuped 两个序列恒为 0 —— 不是「没有丢弃」，而是未埋点。
+            # 待 Rust core 导出 dropped_reason 后此处自动生效，无需改调用方。
+            dropped_reason=getattr(binding_result, "dropped_reason", None),
         )
         return _fill_evict_result(binding_result, result)
 

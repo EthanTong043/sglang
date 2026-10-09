@@ -55,6 +55,25 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
 
+    # 丢弃归因（write-through / write_through_selective 路径）。
+    #
+    # 为什么是一个字段而不是在 TreeCore 里直接打点：TreeCore 是纯数据结构层，
+    # 不持有 metrics_collector（全文件零引用），指标归 Controller
+    # (UnifiedRadixCache) 负责上报 —— 既有的 host_pressure 打点也在那一层
+    # (unified_radix_cache.py:_record_dropped_tokens)。让 TreeCore 返回「这一步
+    # 丢了什么、为什么丢」，由 Controller 落到 Prometheus，才与 Rust TreeCore
+    # 共用同一个 ABC 接口，不把观测性要求写进两个实现里。
+    #
+    # 语义（None 表示这一步不是无备份丢弃，例如 demote 或 write_back 延迟备份）：
+    #   - "below_write_threshold": hit_count < write_through_threshold，
+    #     write_through_selective 根本没发起过备份 —— 阈值饥饿信号
+    #   - "never_backuped": 已达阈值但备份没落地（host 分配失败 / 传输未完成）
+    #
+    # 只覆盖 evict_device_leaf 的写穿透丢弃分支。drop_subtree_no_host 复用了同一个
+    # _delete_unbacked_device_leaf 辅助函数，但它已由 host_pressure 单独计数，
+    # 因此归因必须打在调用点而不是辅助函数里，否则两条路径会重复计数。
+    dropped_reason: Optional[str] = None
+
 
 class DemoteResult(BaseEvictionResult):
     pass

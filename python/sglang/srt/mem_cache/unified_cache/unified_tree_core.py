@@ -1342,6 +1342,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
                 return result
             # Write-through: node has no backup, delete entirely.
+            # 归因必须在这里读 hit_count：_delete_unbacked_device_leaf 会把节点从
+            # 树上摘掉，之后再读 hit_count 就不可靠了；而且该辅助函数被
+            # drop_subtree_no_host 共用（那条路径已单独计入 host_pressure），
+            # 打在辅助函数里会导致两条路径重复计数。
+            #
+            # 偏保守：_split_node 会把 child.hit_count 复制给新父节点
+            # (见 _split_node 中 new_node.hit_count = child.hit_count)，
+            # 节点可能带着并非自己挣到的继承命中数，从而被判出
+            # below_write_threshold。因此该计数器是**低估**阈值饥饿，而非高估。
+            result.dropped_reason = (
+                "below_write_threshold"
+                if node.hit_count < self.write_through_threshold
+                else "never_backuped"
+            )
             self._delete_unbacked_device_leaf(
                 node,
                 result.tracker,

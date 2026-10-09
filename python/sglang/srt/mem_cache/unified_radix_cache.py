@@ -477,11 +477,20 @@ class UnifiedRadixCache(BasePrefixCache):
         # Pre-seed the dropped-tokens series at 0 per pool
         if self.metrics_collector is not None and self.cache_controller is not None:
             for ct in self.tree_components:
-                self.metrics_collector.increment_dropped_tokens(
-                    num_tokens=0,
-                    reason="host_pressure",
-                    pool=_COMPONENT_POOL_LABEL[ct],
-                )
+                # 三个 reason 都预置为 0：压测看的是 rate()/increase()，若某个
+                # reason 直到第一次丢弃才出现，PromQL 在此之前只会得到空向量，
+                # 面板上无法区分「没丢」和「没埋点」—— 这正是本次迁移要消除的
+                # 歧义，所以写穿透的两个新 reason 也必须预置。
+                for reason in (
+                    "host_pressure",
+                    "below_write_threshold",
+                    "never_backuped",
+                ):
+                    self.metrics_collector.increment_dropped_tokens(
+                        num_tokens=0,
+                        reason=reason,
+                        pool=_COMPONENT_POOL_LABEL[ct],
+                    )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
@@ -676,6 +685,27 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._free_values(result.device_frees, result.host_frees)
         self._accumulate_tracker(tracker, result.tracker)
+        # 写穿透无备份丢弃的归因上报。
+        #
+        # 为什么埋在这里而不是 TreeCore：TreeCore 是纯数据结构层，不持有
+        # metrics_collector；既有的 host_pressure 丢弃也是在本层上报的
+        # (见 _record_dropped_tokens)。TreeCore 只回答「丢了什么、为什么」，
+        # 由本层翻译成 Prometheus 序列，Python / Rust 两个 TreeCore 实现因此共享
+        # 同一套观测语义。
+        #
+        # 为什么用 result.tracker 而不是节点长度：unified 实现是多 component 的
+        # (FULL / SWA / MAMBA)，一次 evict 可能同时释放多个池子的 token，且
+        # _delete_unbacked_device_leaf 还会级联删除 tombstone 祖先链 —— 比死代码
+        # 里「一个节点一个 len(node.value)」更激进。tracker 是这一步真实释放的
+        # 每池 token 数，按池拆分上报才与 evicted_tokens 对得上。
+        if result.dropped_reason is not None and self.metrics_collector is not None:
+            for ct, dropped in result.tracker.items():
+                if dropped > 0:
+                    self.metrics_collector.increment_dropped_tokens(
+                        num_tokens=dropped,
+                        reason=result.dropped_reason,
+                        pool=_COMPONENT_POOL_LABEL[ct],
+                    )
         return result.backup_kv
 
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
