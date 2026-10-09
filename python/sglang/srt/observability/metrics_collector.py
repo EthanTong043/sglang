@@ -1876,8 +1876,78 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
-            documentation="Number of backuped tokens.",
+            documentation="Number of tokens that completed the host-to-storage "
+            "(L2->L4) write, i.e. StorageOperation.completed_tokens summed at "
+            "backup-ack drain. This is the ACCEPTANCE-RATE NUMERATOR. Distinct "
+            "from the device-to-host (L1->L2) sglang:hicache_backup_tokens_total.",
             labelnames=labels.keys(),
+        )
+
+        # ↓↓↓ L4(L2→storage)写侧埋点。为什么加在 StorageMetricsCollector 上:
+        # 它是唯一在 L4 写路径上可达、且已持有 storage 标签(storage_backend/
+        # tp_rank/dp_rank/...)的 collector。承接率的分子分母必须同 collector、
+        # 同标签、同进程,否则跨 collector 相除会因标签集不同而无法对齐
+        # (RadixCacheMetricsCollector 只有 cache_type/pool,没有 tp_rank)。
+        self.storage_write_submitted_tokens_total = Counter(
+            name="sglang:hicache_storage_write_submitted_tokens_total",
+            documentation="Tokens ENQUEUED for the host-to-storage (L2->L4) "
+            "write, counted at submission before any IO. Pairs with "
+            "sglang:backuped_tokens_total (completed): submitted minus "
+            "completed is in-flight plus silently-lost work. A nonzero "
+            "submitted with a zero completed rate is the signature of the "
+            "historical store-client failure where pushes were discarded "
+            "silently and every *_failed_total stayed at 0.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_write_submitted_bytes_total = Counter(
+            name="sglang:hicache_storage_write_submitted_bytes_total",
+            documentation="Bytes enqueued for the host-to-storage (L2->L4) "
+            "write: tokens * storage_host_pool.size_per_token, the KV payload "
+            "only (sidecar/aux pools excluded). Kept as a SEPARATE counter "
+            "rather than derived from the token counter — the two have "
+            "different denominators and dividing them is meaningless.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_write_failed_tokens_total = Counter(
+            name="sglang:hicache_storage_write_failed_tokens_total",
+            documentation="Tokens that were submitted for the L2->L4 write but "
+            "did not complete, by reason. batch_rejected: the storage backend "
+            "returned a falsy batch result, so _page_backup aborted and the "
+            "remaining pages of that operation were never attempted "
+            "(this is the count those pages would have contributed). "
+            "backend_exception: the backend raised and the backup daemon "
+            "unwound. NOTE: the Mooncake backend collapses its per-object "
+            "native int error codes to a single bool before the controller "
+            "sees them, so alloc-failure / IO-error / timeout are NOT "
+            "distinguishable at this layer — see the README of experiment "
+            "05-l4-write-metrics.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+
+        self.storage_write_duration_seconds = Histogram(
+            name="sglang:hicache_storage_write_duration_seconds",
+            documentation="Wall time of one host-to-storage (L2->L4) backup "
+            "operation, measured around the backend batch-write call in the "
+            "backup daemon thread. Divided into the submitted-bytes rate it "
+            "gives achieved L2->L4 write bandwidth.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+            ],
         )
 
         self.backup_dropped_tokens_total = Counter(
@@ -1948,6 +2018,34 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    # ---- L4(L2→storage)写侧 ----
+    # 语义约定:submitted 在入队处记一次,completed(log_backuped_tokens)在
+    # ack 处记一次,failed 在失败可被观测到的地方按原因记。三者同标签,
+    # 因此 submitted - completed - failed 可作为"在飞 + 静默丢失"的残差。
+
+    def log_storage_write_submitted(self, num_tokens: int, num_bytes: int):
+        """L4 写入提交量。token 与 byte 分开上报,口径不同不可互推。"""
+        if num_tokens > 0:
+            self.storage_write_submitted_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
+        if num_bytes > 0:
+            self.storage_write_submitted_bytes_total.labels(**self.labels).inc(
+                num_bytes
+            )
+
+    def log_storage_write_failed_tokens(self, num_tokens: int, reason: str):
+        """L4 写失败量,按原因分类。reason 取值见 counter documentation。"""
+        if num_tokens > 0:
+            self.storage_write_failed_tokens_total.labels(
+                **self.labels, reason=reason
+            ).inc(num_tokens)
+
+    def observe_storage_write_duration(self, duration_seconds: float):
+        self.storage_write_duration_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
 
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:

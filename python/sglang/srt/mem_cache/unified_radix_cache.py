@@ -1619,6 +1619,31 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return transfers
 
+    def log_storage_write_submitted(self, num_tokens: int) -> None:
+        """L4(L2→storage)写入提交量上报。
+
+        为什么单独抽成方法:write_storage 有两个调用方 —— cache 模式的
+        write_backup_storage 和 buffer 模式的 BufferModePipeline。
+        buffer 模式会在 _finish_write_through_ack 处整条跳过
+        write_backup_storage(见 :1450),只埋在那里会让
+        `--hicache-host-memory-mode buffer_only` 下新序列恒 0,
+        而 L4 其实照写 —— 又一次"没埋点"被误读成"没落盘"。
+        所以两条路径都调这里。
+
+        字节数与 token 数分开上报:byte 用 storage_host_pool.size_per_token
+        换算(这是真正被写往 L4 的那个 host pool),只含 KV 载荷,不含
+        sidecar/aux。两个 counter 口径不同,**不要相除**。
+        """
+        if not self.enable_storage_metrics or self.storage_metrics_collector is None:
+            return
+        if num_tokens <= 0:
+            return
+        pool = getattr(self.cache_controller, "storage_host_pool", None)
+        size_per_token = getattr(pool, "size_per_token", 0) or 0
+        self.storage_metrics_collector.log_storage_write_submitted(
+            num_tokens, num_tokens * size_per_token
+        )
+
     def write_backup_storage(self, node_id: NodeId) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1646,6 +1671,13 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # ★ L4 承接率的分子(提交侧)。埋在 write_storage 之后、按 host_value
+        # 长度计 —— 它是真正交给 storage 的 host 槽位数,与 hash_value 的关系
+        # 是 len(host_value) == len(hash_value) * page_size。
+        # 埋在这一层而不是 tree_core:tree_core 有 Rust 第二实现且无 collector;
+        # 这个方法在两种 backend 下执行次数与取值都相同(spec 是纯数据),
+        # 所以切 rust 不会让本序列归零。
+        self.log_storage_write_submitted(len(spec.host_value))
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
@@ -2442,6 +2474,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    # ★ L4 写失败上报。与 completed_tokens 同点上报,保证
+                    # 分子(落盘)与失败量来自同一次 ack、同一组标签,
+                    # 相加才能和提交量对齐。归因由 backup 守护线程写在
+                    # operation 上(见 cache_controller.StorageOperation),
+                    # 这里只做翻译 —— 守护线程不碰 collector。
+                    failed_reason = getattr(operation, "failed_reason", None)
+                    if failed_reason:
+                        self.storage_metrics_collector.log_storage_write_failed_tokens(
+                            getattr(operation, "failed_tokens", 0), failed_reason
+                        )
+                    write_duration_s = getattr(operation, "write_duration_s", None)
+                    if write_duration_s is not None:
+                        self.storage_metrics_collector.observe_storage_write_duration(
+                            write_duration_s
+                        )
             return drained
 
         def _drain_release():

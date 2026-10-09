@@ -239,6 +239,16 @@ class StorageOperation:
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
         self.stats_total_tokens = 0
+        # L4(L2→storage)写侧失败归因。由 backup 守护线程写、由调度线程在
+        # ack drain 处读并上报 Prometheus —— 与 completed_tokens 完全同一条
+        # 搬运路径。不在守护线程里直接碰 collector:现有 log_backuped_tokens
+        # 也是在 drain 处上报的,跨线程写 prometheus 会引入新的竞态面。
+        # failed_tokens 记的是"已提交但这次没能落盘"的 token 数,
+        # failed_reason 取值见 hicache_storage_write_failed_tokens_total 文档。
+        self.failed_tokens = 0
+        self.failed_reason: Optional[str] = None
+        # 本次 backend 批量写调用的墙钟耗时(秒),用于写延迟 histogram。
+        self.write_duration_s: Optional[float] = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -1259,6 +1269,9 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        # 写延迟只覆盖 backend 批量写调用本身,不含排队等待 —— 否则队列积压
+        # 会被误读成 L4 变慢。
+        write_elapsed = 0.0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1267,16 +1280,29 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            _t0 = time.perf_counter()
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            write_elapsed += time.perf_counter() - _t0
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
+                # ★ L4 写失败埋点。必须记在 break 之前:这个 break 放弃了本
+                # operation 剩余的所有 page,原先只留一行 warning,计数完全
+                # 丢失 —— 于是"写进去了但读不到"和"根本没写进去"在面板上
+                # 长得一模一样。这正是历史上 store-client 静默丢弃能躲过
+                # 所有 *_failed_total 的原因。
+                # 口径:从当前失败批次起,本 operation 剩余的全部 token 都算
+                # 失败(它们确实一个都没落盘),而不是只算失败的那一批。
+                remaining_pages = len(operation.hash_value) - i
+                operation.failed_tokens = remaining_pages * self.page_size
+                operation.failed_reason = "batch_rejected"
                 break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+        operation.write_duration_s = write_elapsed
 
     def backup_thread_func(self):
         """
@@ -1294,6 +1320,19 @@ class HiCacheController:
 
             except Empty:
                 continue
+            except Exception:
+                # 原先只 catch Empty:backend 抛异常会直接杀掉这个守护线程,
+                # 之后所有 L4 写入静默停止 —— 没有 ack、没有计数、没有日志,
+                # 与历史上那个静默丢弃故障同一形态。这里归因后仍然 ack,
+                # 让调度线程能释放 host lock 并把失败量上报 Prometheus。
+                logger.exception("Storage backup operation failed")
+                operation.failed_tokens = max(
+                    len(operation.hash_value) * self.page_size
+                    - operation.completed_tokens,
+                    0,
+                )
+                operation.failed_reason = "backend_exception"
+                self.ack_backup_queue.put(operation)
 
     def prefetch_sync_thread_func(self):
         """Synchronize prefetch results across all PP and TP ranks."""

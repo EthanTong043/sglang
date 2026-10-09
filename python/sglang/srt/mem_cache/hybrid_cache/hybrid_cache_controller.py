@@ -752,6 +752,19 @@ class HybridCacheController(BaseHiCacheController):
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
+            except Exception:
+                # 与基类同因:原先只 catch Empty,backend 抛异常会静默杀死
+                # 这个守护线程,L4 写入从此停止且无任何可观测信号。
+                # 这是真正被构造的 controller(registry → UnifiedRadixCache →
+                # HybridCacheController),所以这一处才是活路径上的那个。
+                logger.exception("Storage backup operation failed")
+                operation.failed_tokens = max(
+                    len(operation.hash_value) * self.page_size
+                    - operation.completed_tokens,
+                    0,
+                )
+                operation.failed_reason = "backend_exception"
+                self.ack_backup_queue.put(operation)
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

@@ -642,6 +642,11 @@ class BufferModePipeline:
             snapshot.prefix_keys,
             extra_pools=storage_xfers or None,
         )
+        # ★ L4 承接率分子(提交侧),buffer 模式分支。
+        # buffer 模式不经过 UnifiedRadixCache.write_backup_storage,
+        # 只埋在那边会让本模式下新序列恒 0 而 L4 照写。口径与 cache 模式
+        # 一致:按交给 storage 的 host 槽位数计。
+        self._cache.log_storage_write_submitted(len(entry.host_indices))
         self.ongoing_backup[operation_id] = entry
 
     def finish_storage_write_ack(self, operation_id: int) -> None:
