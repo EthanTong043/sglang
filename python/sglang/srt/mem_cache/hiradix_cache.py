@@ -1233,6 +1233,36 @@ class HiRadixCache(RadixCache):
         """write_through / write_through_selective: drop non-backuped leaves,
         demote already-backuped ones. Nothing is staged to host during eviction,
         so this is a plain on-the-fly pass.
+
+        Every leaf this loop retires takes exactly one of two exits, and both
+        are instrumented, so the two counters partition the eviction stream:
+
+            dropped{below_write_threshold} + dropped{never_backuped}
+                + backup_tokens  ~=  evicted_tokens
+
+        Why it holds: `evicted_tokens` (increment_eviction_num_tokens, summed
+        over this return value) counts every device token released here. A leaf
+        is either `backuped` -- its tokens reached host DRAM and are counted
+        once by `backup_tokens` (increment_backup_num_tokens, on backup ack) --
+        or not, in which case `_evict_regular` destroys it and charges it to
+        one of the two `dropped` reasons. No leaf takes both exits, and none
+        takes neither.
+
+        Why it is worth checking: it validates *coverage*, not just values. A
+        persistent deficit (evicted > dropped + backup) means device tokens are
+        vanishing through a path with no instrumentation -- exactly the blind
+        spot these two reasons close. A surplus means double counting.
+
+        Expect an approximate, not exact, match:
+          - `backup_tokens` covers all D->H backups including write_back mode
+            and draft/sidecar pools, while these `dropped` series are KV-pool
+            eviction only;
+          - backups are counted on ack, so in-flight writes at scrape time land
+            in a later sample than the eviction that is already recorded;
+          - a node backed up once can be loaded back and evicted again, so the
+            terms drift apart over a long window.
+        A previous run of the sibling identity `evicted ~= backup + load_back`
+        measured a ratio of 0.9990, which is the order of agreement to expect.
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
@@ -1307,6 +1337,29 @@ class HiRadixCache(RadixCache):
         self.kv_events.record_remove(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+        # Attribute the loss: "below_write_threshold" means the node never
+        # reached write_through_threshold hits, so write_through_selective
+        # never even started a backup -- this quantifies the starvation the
+        # threshold causes. "never_backuped" means the threshold was reached
+        # but the backup did not land (host alloc failure, in-flight write, or
+        # a failed/aborted transfer). Read hit_count before _delete_leaf.
+        #
+        # Conservative by construction: _split_node copies hit_count from the
+        # child it splits off (see _split_node, new_node.hit_count = ...), so a
+        # node can carry inherited hits it did not earn itself. That inflates
+        # hit_count and pushes nodes out of "below_write_threshold", meaning
+        # this counter *under*-reports threshold starvation rather than
+        # over-reporting it.
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.increment_dropped_tokens(
+                num_tokens=num_evicted,
+                reason=(
+                    "below_write_threshold"
+                    if node.hit_count < self.write_through_threshold
+                    else "never_backuped"
+                ),
+                pool=PoolName.KV.value,
+            )
         self._delete_leaf(node)
         return num_evicted
 

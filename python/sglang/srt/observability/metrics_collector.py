@@ -2156,8 +2156,12 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens = Counter(
             name="sglang:hicache_dropped_tokens_total",
             documentation="The number of device KV tokens destroyed without a "
-            "host backup, by pool (kv, swa, ...) and reason (e.g. write-back "
-            "backup failure under host memory pressure).",
+            "host backup, by pool (kv, swa, ...) and reason: host_pressure "
+            "(write-back backup failure under host memory pressure), "
+            "below_write_threshold (evicted before reaching "
+            "--hicache-write-policy's write-through hit threshold, so no "
+            "backup was ever started), never_backuped (threshold reached but "
+            "the backup did not land).",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
