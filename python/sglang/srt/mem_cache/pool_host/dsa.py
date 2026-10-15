@@ -325,10 +325,20 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_indices=host_page_indices,
                     page_size=1,
                 )
+            elif self.layout == "page_first_direct":
+                # Mirror the MLA per-layer direct backup: CP writes only the
+                # owned local indexer layer into the page-first host pool.
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
+                    dst_ptrs=[self.index_k_with_scale_buffer],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
             else:
                 raise ValueError(
                     "Layer-sharded direct DSA indexer backup only supports "
-                    f"layer_first layout, got {self.layout}"
+                    f"layer_first or page_first_direct layout, got {self.layout}"
                 )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")

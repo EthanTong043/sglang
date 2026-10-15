@@ -403,10 +403,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
+            elif self.layout == "page_first_direct":
+                # CP owns one contiguous local layer range.  Keep the existing
+                # page-first host pool and reuse the all-layer LF->PF direct
+                # kernel with a single source layer; its destination page is
+                # selected at local layer zero by the host pool's local view.
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[device_pool.kv_buffer[device_layer_id]],
+                    dst_ptrs=[self.kv_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
             else:
                 raise ValueError(
                     "Layer-sharded direct HiCache backup only supports "
-                    f"layer_first layout, got {self.layout}"
+                    f"layer_first or page_first_direct layout, got {self.layout}"
                 )
         else:
             raise ValueError(
