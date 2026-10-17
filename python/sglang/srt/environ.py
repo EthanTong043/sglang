@@ -771,6 +771,11 @@ class Envs:
     # 额外写入的 DFS 副本数（0=不写，1=写一份到挂载的并行文件系统）。
     # 不设则 Mooncake 用 ReplicateConfig 默认值 0，DFS 永远不会被写入。
     MOONCAKE_DFS_REPLICA_NUM = EnvInt(0)
+    # Explicit zero-L3 mode. This is intentionally separate from
+    # MOONCAKE_DFS_REPLICA_NUM: requesting a DFS replica alone preserves the
+    # historical MEMORY+DFS behavior.
+    MOONCAKE_DFS_ONLY = EnvBool(False)
+    MOONCAKE_REPLICA_NUM = EnvInt(1)
 
     # ===================================================================
     # MoRI transport and expert dispatch

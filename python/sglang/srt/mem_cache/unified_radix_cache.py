@@ -1638,7 +1638,16 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         if num_tokens <= 0:
             return
+        # Accepted cache-controller variants expose the KV host pool either
+        # directly or through mem_pool_host.anchor_entry.host_pool. Keep the
+        # byte denominator tied to the actual KV pool instead of silently
+        # reporting zero bytes when only the latter shape is available.
         pool = getattr(self.cache_controller, "storage_host_pool", None)
+        if pool is None:
+            pool = getattr(self.cache_controller, "mem_pool_host", None)
+        anchor = getattr(pool, "anchor_entry", None)
+        if anchor is not None:
+            pool = getattr(anchor, "host_pool", anchor)
         size_per_token = getattr(pool, "size_per_token", 0) or 0
         self.storage_metrics_collector.log_storage_write_submitted(
             num_tokens, num_tokens * size_per_token
@@ -1891,10 +1900,18 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
+        page_count = len(operation.hash_value)
+        if page_count == 0 and not getattr(operation, "_prefetch_query_done", False):
+            # Hashing and existence lookup precede publication of the hit-page
+            # chain. Budget that pending work from the requested logical span
+            # (RadixKey.__len__ already accounts for bigrams), not an empty
+            # hash list. Keep the original start time and hit-page budget once
+            # a result is available; this does not renew the deadline.
+            page_count = len(operation.token_ids) // self.page_size
         return (
             time.monotonic() - operation.start_time
             > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+            + page_count * self.prefetch_timeout_per_page
         )
 
     @rank_consensus(same_results=True)
@@ -2400,6 +2417,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                # The queue publishes a completed query, including zero-hit
+                # results. Misses below threshold are still revoked below.
+                operation._prefetch_query_done = True
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
                 if info is None:
@@ -2489,6 +2509,10 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_metrics_collector.observe_storage_write_duration(
                             write_duration_s
                         )
+                    for pool, reason in getattr(operation, "sidecar_failures", []):
+                        self.storage_metrics_collector.log_storage_write_sidecar_failure(
+                            pool, reason
+                        )
             return drained
 
         def _drain_release():
@@ -2521,11 +2545,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_and_alloc_storage_hit()
-        _drain_ack_prefetch()
-        _drain_backup()
         _drain_release()
         _drain_extra_release()
+        # Release pages already queued by completed prefetches before
+        # allocating the next storage hit.  This preserves the existing
+        # ownership protocol while avoiding a one-tick false L2 pressure
+        # decision (evict/revoke) when free pages are already available.
+        _drain_and_alloc_storage_hit()
+        # Keep tree/host-lock mutations from ACK and backup after hit
+        # allocation. Releases created by this round remain queued for the
+        # next synchronized drain, so the current hit observes only pages
+        # whose ownership was already synchronized by n_release.
+        _drain_ack_prefetch()
+        _drain_backup()
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller

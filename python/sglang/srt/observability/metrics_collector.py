@@ -1909,6 +1909,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "different denominators and dividing them is meaningless.",
             labelnames=labels.keys(),
         )
+        # Materialize zero-valued source counters as soon as the storage
+        # collector exists.  This distinguishes healthy 100% completion,
+        # all-failed 0% completion, and an unregistered/disabled collector;
+        # no histogram observation is created by this initialization.
+        for _counter in (
+            self.storage_write_submitted_tokens_total,
+            self.storage_write_submitted_bytes_total,
+            self.backuped_tokens_total,
+        ):
+            _counter.labels(**self.labels)
 
         self.storage_write_failed_tokens_total = Counter(
             name="sglang:hicache_storage_write_failed_tokens_total",
@@ -1924,6 +1934,21 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "distinguishable at this layer — see the README of experiment "
             "05-l4-write-metrics.",
             labelnames=list(labels.keys()) + ["reason"],
+        )
+        # Materialize the two stable failure-reason children at collector
+        # creation.  Prometheus otherwise omits a Counter child until the
+        # first failure event, making a healthy run (submitted == completed,
+        # zero failures) indistinguishable from a collector that was never
+        # registered.  The collector itself is still absent when storage
+        # metrics are disabled, so the query layer can keep that distinction.
+        for _reason in ("batch_rejected", "backend_exception"):
+            self.storage_write_failed_tokens_total.labels(
+                **self.labels, reason=_reason
+            )
+        self.storage_write_sidecar_failed_operations_total = Counter(
+            name="sglang:hicache_storage_write_sidecar_failed_operations_total",
+            documentation="Hybrid sidecar backup operations with a rejected or exceptional pool result.",
+            labelnames=list(labels.keys()) + ["pool", "reason"],
         )
 
         self.storage_write_duration_seconds = Histogram(
@@ -2041,6 +2066,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.storage_write_failed_tokens_total.labels(
                 **self.labels, reason=reason
             ).inc(num_tokens)
+
+    def log_storage_write_sidecar_failure(self, pool: str, reason: str):
+        self.storage_write_sidecar_failed_operations_total.labels(
+            **self.labels, pool=pool, reason=reason
+        ).inc()
 
     def observe_storage_write_duration(self, duration_seconds: float):
         self.storage_write_duration_seconds.labels(**self.labels).observe(

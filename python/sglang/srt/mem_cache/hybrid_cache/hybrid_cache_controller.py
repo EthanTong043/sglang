@@ -687,9 +687,20 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(backup_transfers)
+            try:
+                results = self.storage_backend.batch_set_v2(backup_transfers)
+            except Exception:
+                for transfer in backup_transfers:
+                    operation.sidecar_failures.append(
+                        (
+                            str(getattr(transfer.name, "value", transfer.name)),
+                            "backend_exception",
+                        )
+                    )
+                raise
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
+            self._record_sidecar_failures(operation, backup_transfers, results)
 
         if not self.backup_skip:
             super()._page_backup(operation)
@@ -758,13 +769,40 @@ class HybridCacheController(BaseHiCacheController):
                 # 这是真正被构造的 controller(registry → UnifiedRadixCache →
                 # HybridCacheController),所以这一处才是活路径上的那个。
                 logger.exception("Storage backup operation failed")
-                operation.failed_tokens = max(
-                    len(operation.hash_value) * self.page_size
-                    - operation.completed_tokens,
-                    0,
-                )
+                if operation.sidecar_failures and operation.completed_tokens == 0:
+                    # Sidecar failure is reported separately; do not pretend
+                    # that primary KV pages were attempted and failed.
+                    operation.failed_tokens = 0
+                else:
+                    operation.failed_tokens = max(
+                        len(operation.hash_value) * self.page_size
+                        - operation.completed_tokens,
+                        0,
+                    )
                 operation.failed_reason = "backend_exception"
                 self.ack_backup_queue.put(operation)
+
+    def _record_sidecar_failures(self, operation, transfers, results):
+        page_size = self.page_size
+        for transfer in transfers:
+            result = results.get(transfer.name)
+            if result is None:
+                result = results.get(getattr(transfer.name, "value", transfer.name))
+            expected = len(transfer.keys or [])
+            if expected == 0 and transfer.host_indices is not None:
+                expected = int(transfer.host_indices.numel()) // page_size
+            valid = (
+                isinstance(result, (list, tuple))
+                and len(result) == expected
+                and all(bool(ok) for ok in result)
+            )
+            if not valid:
+                operation.sidecar_failures.append(
+                    (
+                        str(getattr(transfer.name, "value", transfer.name)),
+                        "batch_rejected",
+                    )
+                )
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

@@ -249,6 +249,10 @@ class StorageOperation:
         self.failed_reason: Optional[str] = None
         # 本次 backend 批量写调用的墙钟耗时(秒),用于写延迟 histogram。
         self.write_duration_s: Optional[float] = None
+        # Hybrid sidecar failures are counted separately from primary KV
+        # tokens. Each item is (pool, reason), recorded by the controller and
+        # emitted by the scheduler-side ACK drain.
+        self.sidecar_failures: list[tuple[str, str]] = []
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -560,6 +564,10 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
+        # Load/compile the CPU page-hash kernel before storage threads or
+        # readiness expose the first request to that one-time startup cost.
+        # Empty input initializes the loader and produces no cache keys.
+        self.get_hash_str([], page_size=self.page_size)
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
@@ -1214,7 +1222,15 @@ class HiCacheController:
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    try:
+                        hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    except Exception as exc:
+                        # Still join the normal rank MIN and publish the query
+                        # result so the scheduler can release this request.
+                        # Exception text may contain keys or request contents.
+                        logger.error("Storage metadata query failed: %s", type(exc).__name__)
+                        operation.mark_terminate()
+                        hash_value, storage_hit_count = [], 0
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
