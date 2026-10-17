@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _should_skip_primary_backup(storage_config: HiCacheStorageConfig) -> bool:
+    """Return whether replicated-MLA primary backup is redundant on this rank."""
+    return bool(
+        storage_config.is_mla_model
+        and storage_config.tp_rank != 0
+        and not getattr(storage_config, "layer_sharded", False)
+    )
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -572,11 +581,9 @@ class HiCacheController:
             model_name, storage_backend_extra_config
         )
         # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
+        # Replicated MLA needs one primary writer; layer-split MLA needs one
+        # writer per CP-owned slice.
+        self.backup_skip = _should_skip_primary_backup(self.storage_config)
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -743,6 +750,29 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        # LayerSplitDSATokenToKVPool keeps the layer-shard metadata on the
+        # device pool. The host pool intentionally has a fixed ceil-sized
+        # local layout (20 slots for 78/CP4), so derive ownership from the
+        # device pool's exact range rather than from host slot count.
+        layer_sharded = bool(
+            getattr(self.mem_pool_device, "layer_shard_enabled", False)
+        )
+        owned_layer_start = None
+        owned_layer_end = None
+        if layer_sharded:
+            owned_range_fn = getattr(
+                self.mem_pool_device, "_owned_local_layer_range", None
+            )
+            if not callable(owned_range_fn):
+                raise RuntimeError(
+                    "layer_shard_enabled pool must expose "
+                    "_owned_local_layer_range()"
+                )
+            local_start, local_end = owned_range_fn()
+            global_start = int(getattr(self.mem_pool_device, "start_layer", 0))
+            owned_layer_start = global_start + int(local_start)
+            owned_layer_end = global_start + int(local_end)
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -758,6 +788,9 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            layer_sharded=layer_sharded,
+            owned_layer_start=owned_layer_start,
+            owned_layer_end=owned_layer_end,
         )
 
     def reset(self):

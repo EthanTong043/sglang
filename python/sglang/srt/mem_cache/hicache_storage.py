@@ -38,6 +38,12 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # DSA layer-split storage owns a disjoint contiguous layer range on each
+    # CP rank. Keep this explicit instead of inferring ownership from the
+    # replicated-MLA flag, which is also true for LayerSplitDSA pools.
+    layer_sharded: bool = False
+    owned_layer_start: Optional[int] = None
+    owned_layer_end: Optional[int] = None
 
 
 @dataclass

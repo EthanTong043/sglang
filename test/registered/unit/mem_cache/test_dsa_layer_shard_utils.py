@@ -25,6 +25,16 @@ class TestDSALayerShardUtils(CustomTestCase):
             [0, 0, 0, 1, 1, 1, 2, 2, 3, 3],
         )
 
+    def test_glm53_78_layer_cp4_ranges_and_owners(self):
+        ranges = [get_layer_shard_range(rank, 4, 78) for rank in range(4)]
+        self.assertEqual(ranges, [(0, 20), (20, 40), (40, 59), (59, 78)])
+
+        owners = [get_layer_owner(layer_id, 4, 78) for layer_id in range(78)]
+        self.assertEqual(owners[:20], [0] * 20)
+        self.assertEqual(owners[20:40], [1] * 20)
+        self.assertEqual(owners[40:59], [2] * 19)
+        self.assertEqual(owners[59:], [3] * 19)
+
     def test_empty_tail_shards_have_empty_ranges(self):
         ranges = [get_layer_shard_range(rank, 4, 2) for rank in range(4)]
         self.assertEqual(ranges, [(0, 1), (1, 2), (2, 2), (2, 2)])

@@ -79,6 +79,7 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -100,6 +101,7 @@ def _fake_store_class():
             return self.objects.get(key)
 
         def batch_is_exist(self, keys):
+            self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
@@ -206,6 +208,13 @@ def _make_config(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    pp_rank=0,
+    pp_size=1,
+    attn_cp_rank=0,
+    attn_cp_size=1,
+    layer_sharded=False,
+    owned_layer_start=None,
+    owned_layer_end=None,
 ):
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
@@ -219,10 +228,10 @@ def _make_config(
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=tp_size,
-        pp_rank=0,
-        pp_size=1,
-        attn_cp_rank=0,
-        attn_cp_size=1,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
         is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -230,6 +239,9 @@ def _make_config(
         tp_lcm_size=tp_lcm_size,
         should_split_heads=should_split_heads,
         extra_config=extra_config,
+        layer_sharded=layer_sharded,
+        owned_layer_start=owned_layer_start,
+        owned_layer_end=owned_layer_end,
     )
 
 
@@ -244,6 +256,13 @@ def _make_store(
     tp_rank=0,
     tp_size=1,
     tp_lcm_size=None,
+    pp_rank=0,
+    pp_size=1,
+    attn_cp_rank=0,
+    attn_cp_size=1,
+    layer_sharded=False,
+    owned_layer_start=None,
+    owned_layer_end=None,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -255,6 +274,13 @@ def _make_store(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_lcm_size=tp_lcm_size,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        layer_sharded=layer_sharded,
+        owned_layer_start=owned_layer_start,
+        owned_layer_end=owned_layer_end,
     )
 
     with patch.dict(
@@ -451,6 +477,78 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_layer_split_v1_v2_use_one_cp_pp_physical_key_helper(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            extra_backend_tag="tag",
+            is_mla_model=True,
+            pp_rank=1,
+            pp_size=2,
+            attn_cp_rank=2,
+            attn_cp_size=4,
+            layer_sharded=True,
+            owned_layer_start=40,
+            owned_layer_end=59,
+        )
+        kv_pool = FakeHostKVCache(objects_per_page=1)
+        store.register_mem_pool_host(kv_pool)
+        store.registered_pools[PoolName.KV] = kv_pool
+
+        v1_keys, _, _ = store._get_mla_buffer_meta(
+            ["tag_page0"], torch.tensor([0])
+        )
+        v2_keys, multiplier = store._get_hybrid_page_component_keys(
+            ["tag_page0"],
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["page0"],
+                host_indices=torch.tensor([0]),
+            ),
+        )
+        self.assertEqual(v1_keys, ["tag_page0_cp2_4_pp1_k"])
+        self.assertEqual(v2_keys, v1_keys)
+        self.assertEqual(multiplier, 1)
+
+        store.batch_exists(["page0"])
+        self.assertEqual(
+            fake_store.batch_exist_calls[-1], ["tag_page0_cp2_4_pp1_k"]
+        )
+
+        indexer_pool = FakeIndexerPool()
+        store.register_mem_host_pool_v2(indexer_pool, PoolName.INDEXER)
+        sidecar_keys, sidecar_multiplier = store._get_hybrid_page_component_keys(
+            ["page0"],
+            PoolTransfer(
+                name=PoolName.INDEXER,
+                keys=["page0"],
+                host_indices=torch.tensor([0]),
+            ),
+        )
+        self.assertEqual(sidecar_keys, ["page0_cp2_4_pp1_indexer"])
+        self.assertEqual(sidecar_multiplier, 1)
+
+    def test_layer_split_cp_ranks_never_share_mla_physical_keys(self):
+        keys = []
+        for cp_rank in range(4):
+            store, _ = _make_store(
+                enable_group_semantics=False,
+                is_mla_model=True,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=4,
+                layer_sharded=True,
+            )
+            keys.append(store._make_mla_physical_key("page0", "k"))
+        self.assertEqual(
+            keys,
+            [
+                "page0_cp0_4_pp0_k",
+                "page0_cp1_4_pp0_k",
+                "page0_cp2_4_pp0_k",
+                "page0_cp3_4_pp0_k",
+            ],
+        )
+        self.assertEqual(len(set(keys)), 4)
 
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(

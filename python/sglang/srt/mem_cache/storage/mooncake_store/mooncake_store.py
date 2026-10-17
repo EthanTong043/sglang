@@ -583,7 +583,7 @@ class _DfsRepairState:
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     # A DFS-only duplicate write is idempotent only after a readable COMPLETE
-    # replica is visible. Keep this gate bounded; a processing key must not be
+    # replica is visible. Keep this gate bounded; a PROCESSING key must not be
     # converted into a successful cache write indefinitely.
     _DFS_DUPLICATE_READY_TIMEOUT_S = 5.0
     _DFS_DUPLICATE_READY_BACKOFF_S = (0.01, 0.02, 0.05, 0.1, 0.2)
@@ -909,6 +909,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
                 self.attn_cp_size = storage_config.attn_cp_size
+                self.layer_sharded = bool(
+                    getattr(storage_config, "layer_sharded", False)
+                )
+                self.owned_layer_start = getattr(
+                    storage_config, "owned_layer_start", None
+                )
+                self.owned_layer_end = getattr(
+                    storage_config, "owned_layer_end", None
+                )
                 self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
@@ -917,6 +926,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.pp_size = 1
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
+                self.layer_sharded = False
+                self.owned_layer_start = None
+                self.owned_layer_end = None
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -1096,6 +1108,50 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return keys
         return [f"{self.config_prefix}_{key}" for key in keys]
 
+    def _mla_ownership_suffix(self, owner_pool: Optional[Any] = None) -> str:
+        """Return the physical ownership portion of an MLA key.
+
+        Replicated MLA keeps its historical suffix for cache compatibility.
+        Layer-split MLA must identify both the CP slice and PP partition; CP4
+        therefore produces ``cp{rank}_{size}_pp{pp_rank}`` even when PP=1.
+        """
+        layer_sharded = getattr(self, "layer_sharded", False)
+        attn_cp_rank = getattr(self, "attn_cp_rank", 0)
+        attn_cp_size = getattr(self, "attn_cp_size", 1)
+        if owner_pool is not None:
+            pool_device = getattr(owner_pool, "device_pool", None)
+            if pool_device is not None:
+                layer_sharded = bool(
+                    getattr(pool_device, "layer_shard_enabled", False)
+                )
+                attn_cp_rank = getattr(
+                    pool_device, "layer_shard_rank", attn_cp_rank
+                )
+                attn_cp_size = getattr(
+                    pool_device, "layer_shard_size", attn_cp_size
+                )
+        if layer_sharded:
+            if attn_cp_size <= 1:
+                raise RuntimeError(
+                    "layer_sharded MLA storage requires attn_cp_size > 1"
+                )
+            return (
+                f"cp{attn_cp_rank}_{attn_cp_size}_pp"
+                f"{getattr(self, 'pp_rank', 0)}"
+            )
+        return getattr(self, "mla_suffix", "")
+
+    def _make_mla_physical_key(
+        self,
+        logical_key: str,
+        component: str,
+        owner_pool: Optional[Any] = None,
+    ) -> str:
+        """Build one MLA physical object key from a tagged logical key."""
+        return (
+            f"{logical_key}_{self._mla_ownership_suffix(owner_pool)}_{component}"
+        )
+
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
 
@@ -1127,9 +1183,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Suffix order must match get_page_buffer_meta() for one page, because
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
+
+        def mla_component_keys(component: str) -> Tuple[List[str], int]:
+            return (
+                [
+                    self._make_mla_physical_key(page_key, component, host_pool)
+                    for page_key in page_keys
+                ],
+                1,
+            )
+
         suffixes = []
         if pool_name == PoolName.KV:
-            suffixes = [f"_{self.mla_suffix}_k"]
+            return mla_component_keys("k")
         elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
@@ -1147,7 +1213,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
             if isinstance(draft_pool, MLATokenToKVPoolHost):
-                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
+                return mla_component_keys(f"{PoolName.DRAFT}_k")
             else:
                 suffixes = [
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
@@ -1163,7 +1229,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 host_pool,
                 (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),
             ):
-                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+                return mla_component_keys(str(pool_name))
             elif isinstance(host_pool, MHATokenToKVPoolHost):
                 suffixes = [
                     f"_{self.mha_suffix}_{pool_name}_k",
@@ -1181,7 +1247,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
-            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            return mla_component_keys(str(pool_name))
         elif pool_name == PoolName.SWA:
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
                 # Ordinary MHA SWA mirrors a K/V pool.
@@ -1190,7 +1256,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{pool_name}_v",
                 ]
             elif self.is_mla_backend:
-                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+                return mla_component_keys(str(pool_name))
 
         if not suffixes:
             raise ValueError(
@@ -1416,7 +1482,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
         for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+            key_list.append(self._make_mla_physical_key(key_, "k"))
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
@@ -1766,7 +1832,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            query_keys = [
+                self._make_mla_physical_key(key, "k") for key in keys
+            ]
             key_multiplier = 1
         else:
             query_keys = []
@@ -2010,8 +2078,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         the ordinary ``BatchGetReplicaList`` failure counters. The native query
         remains a compatibility fallback for older Mooncake builds. Missing
         keys are rechecked with ``batch_is_exist`` so a key revoked during the
-        wait can be put again. Any unavailable probe fails closed and returns
-        ``processing``.
+        wait can be put again. Any unavailable probe fails closed.
         """
         if not keys:
             return []
@@ -2024,8 +2091,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         while pending:
             selected = [keys[index] for index in pending]
             replica_map = self._batch_readiness_probe(selected)
-            if not isinstance(replica_map, dict):
-                replica_map = {}
             try:
                 exists = self._batch_exist(selected)
             except Exception:
@@ -2034,6 +2099,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             next_pending = []
             for local_index, index in enumerate(pending):
                 key = selected[local_index]
+                if replica_map is None:
+                    # Mooncake's native ExistKey path already requires a
+                    # readable COMPLETE replica. Use it when the selected
+                    # build has neither the admin endpoint nor the legacy
+                    # replica-description API.
+                    if local_index < len(exists) and exists[local_index] == 1:
+                        statuses[index] = "ready"
+                    else:
+                        statuses[index] = "missing"
+                    continue
+                if not isinstance(replica_map, dict):
+                    replica_map = {}
                 replicas = replica_map.get(key)
                 if isinstance(replicas, (list, tuple)) and replicas:
                     statuses[index] = "ready"
@@ -2049,7 +2126,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if remaining <= 0:
                 break
             time.sleep(min(delay, remaining))
-            delay = next(backoffs, min(delay * 2, self._DFS_DUPLICATE_READY_BACKOFF_S[-1]))
+            delay = next(
+                backoffs,
+                min(delay * 2, self._DFS_DUPLICATE_READY_BACKOFF_S[-1]),
+            )
 
         if pending:
             logger.warning(
@@ -2059,14 +2139,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return statuses
 
     def _batch_readiness_probe(self, keys):
-        """Return keys with readable COMPLETE replicas without polluting ramp counters."""
+        """Return keys with readable COMPLETE replicas without polluting counters."""
         admin_result = self._batch_admin_readiness_probe(keys)
         if admin_result is not None:
             return admin_result
 
         query = getattr(self.store, "batch_get_replica_desc", None)
         if not callable(query):
-            return {}
+            return None
         logger.warning(
             "DFS readiness probe falling back to ordinary BatchGetReplicaList; "
             "PROCESSING probes may be included in master failure counters"

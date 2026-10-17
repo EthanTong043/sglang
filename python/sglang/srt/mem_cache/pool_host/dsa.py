@@ -326,11 +326,16 @@ class DSAIndexerPoolHost(HostKVCache):
                     page_size=1,
                 )
             elif self.layout == "page_first_direct":
-                # Mirror the MLA per-layer direct backup: CP writes only the
-                # owned local indexer layer into the page-first host pool.
+                # A one-layer LF->PF call starts at local slot zero. Restrict
+                # the destination view to the requested host layer so draft
+                # and other per-layer callers cannot overwrite slot 0.
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
-                    dst_ptrs=[self.index_k_with_scale_buffer],
+                    dst_ptrs=[
+                        self.index_k_with_scale_buffer[
+                            :, host_layer_id : host_layer_id + 1
+                        ]
+                    ],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
                     page_size=1,
@@ -347,18 +352,43 @@ class DSAIndexerPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
-                self._backup_from_device_per_layer(
-                    device_pool, host_indices, device_indices, layer_id, io_backend
+            owned_layer_ids = self._owned_device_layer_ids(device_pool)
+            if io_backend == "direct" and self.layout == "page_first_direct":
+                # Keep the owned layer order in consecutive host slots. A
+                # one-layer LF->PF call always starts at local slot 0 and would
+                # otherwise overwrite the previous CP slice.
+                host_page_indices, device_page_indices = self._get_indexer_page_indices(
+                    host_indices, device_indices
                 )
-            for draft_layer_id, draft_device_pool in enumerate(
-                self.mtp_draft_device_pools
-            ):
+                if owned_layer_ids:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=[
+                            device_pool.index_k_with_scale_buffer[layer_id]
+                            for layer_id in owned_layer_ids
+                        ],
+                        dst_ptrs=[self.index_k_with_scale_buffer],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        page_size=1,
+                    )
+            else:
+                for layer_id in owned_layer_ids:
+                    self._backup_from_device_per_layer(
+                        device_pool, host_indices, device_indices, layer_id, io_backend
+                    )
+            draft_pools = getattr(self, "mtp_draft_device_pools", ())
+            if draft_pools:
+                draft_layer_start = getattr(self, "target_layer_num", None)
+                if draft_layer_start is None:
+                    draft_layer_start = getattr(
+                        getattr(self, "device_pool", None), "layer_num", 0
+                    )
+            for draft_layer_id, draft_device_pool in enumerate(draft_pools):
                 self._backup_from_device_per_layer(
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    draft_layer_start + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )

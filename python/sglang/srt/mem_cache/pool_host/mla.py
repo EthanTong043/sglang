@@ -404,13 +404,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
-                # CP owns one contiguous local layer range.  Keep the existing
-                # page-first host pool and reuse the all-layer LF->PF direct
-                # kernel with a single source layer; its destination page is
-                # selected at local layer zero by the host pool's local view.
+                # A one-layer LF->PF call starts at local slot zero. Restrict
+                # the destination to the requested host layer so draft-layer
+                # and other per-layer callers cannot overwrite slot 0.
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=[device_pool.kv_buffer[device_layer_id]],
-                    dst_ptrs=[self.kv_buffer],
+                    dst_ptrs=[
+                        self.kv_buffer[:, host_layer_id : host_layer_id + 1]
+                    ],
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
@@ -436,18 +437,38 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_indices = self.maybe_dcp_kernel_indices(host_indices)
         device_indices = self.maybe_dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
-                self._backup_from_device_per_layer(
-                    device_pool, host_indices, device_indices, layer_id, io_backend
-                )
-            for draft_layer_id, draft_device_pool in enumerate(
-                self.mtp_draft_device_pools
-            ):
+            owned_layer_ids = self._owned_device_layer_ids(device_pool)
+            if io_backend == "direct" and self.layout == "page_first_direct":
+                # The LF->PF direct kernel accepts all owned source layers and
+                # writes them to consecutive local host slots. Calling it once
+                # per layer with a one-element source list would reset
+                # start_layer_id to zero and overwrite slot 0 repeatedly.
+                if owned_layer_ids:
+                    transfer_kv_all_layer_direct_lf_pf(
+                        src_ptrs=[device_pool.kv_buffer[layer_id] for layer_id in owned_layer_ids],
+                        dst_ptrs=[self.kv_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
+            else:
+                for layer_id in owned_layer_ids:
+                    self._backup_from_device_per_layer(
+                        device_pool, host_indices, device_indices, layer_id, io_backend
+                    )
+            draft_pools = getattr(self, "mtp_draft_device_pools", ())
+            if draft_pools:
+                draft_layer_start = getattr(self, "target_layer_num", None)
+                if draft_layer_start is None:
+                    draft_layer_start = getattr(
+                        getattr(self, "device_pool", None), "layer_num", 0
+                    )
+            for draft_layer_id, draft_device_pool in enumerate(draft_pools):
                 self._backup_from_device_per_layer(
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    draft_layer_start + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )
