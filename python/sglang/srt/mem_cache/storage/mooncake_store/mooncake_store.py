@@ -587,6 +587,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     # converted into a successful cache write indefinitely.
     _DFS_DUPLICATE_READY_TIMEOUT_S = 5.0
     _DFS_DUPLICATE_READY_BACKOFF_S = (0.01, 0.02, 0.05, 0.1, 0.2)
+    # Values returned by the admin readiness probe are deliberately distinct
+    # from the legacy ``{key: [descriptor, ...]}`` shape. In particular,
+    # ``BatchExistKey=false`` is not enough to call a key missing: Mooncake
+    # reports false while its DFS descriptor is still PROCESSING. Keep that
+    # state explicit so the write path can fail closed instead of issuing a
+    # racing PutStart.
+    _DFS_READINESS_READY = "__COMPLETE__"
+    _DFS_READINESS_PROCESSING = "__PROCESSING__"
+    _DFS_READINESS_MISSING = "__OBJECT_NOT_FOUND__"
+    _DFS_READINESS_UNKNOWN = "__READINESS_UNKNOWN__"
 
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
@@ -1996,24 +2006,58 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             return failed
         state = self._dfs_repair_state
+        # BatchExistKey/ExistKey only reports readable COMPLETE replicas. A
+        # DFS PutStart that is still PROCESSING therefore appears as
+        # ``exists=0`` even though the metadata is present and a new PutStart
+        # would race with the writer and return OBJECT_ALREADY_EXISTS. Resolve
+        # every such key before classification. Only an explicit
+        # OBJECT_NOT_FOUND result is allowed to enter the ordinary PutStart
+        # path; PROCESSING/unknown results are represented with a non-binary
+        # value so _DfsRepairState.classify filters them out of both ordinary
+        # puts and repair claims.
+        exists_for_classify = list(exists)
+        readiness_by_index = {}
+        zero_indices = [index for index, value in enumerate(exists) if value == 0]
+        if zero_indices:
+            zero_statuses = self._resolve_existing_readiness(
+                [keys[index] for index in zero_indices]
+            )
+            for index, status in zip(zero_indices, zero_statuses):
+                readiness_by_index[index] = status
+                if status == "ready":
+                    exists_for_classify[index] = 1
+                elif status == "missing":
+                    exists_for_classify[index] = 0
+                else:
+                    # PROCESSING, RPC failure, and timeout fail closed. The
+                    # state classifier intentionally ignores non-binary values.
+                    exists_for_classify[index] = None
+
         existing, ordinary, repairs, failure_epoch = state.classify(
-            keys, totals, exists
+            keys, totals, exists_for_classify
         )
         ready_existing = []
-        if existing:
+        unprobed_existing = [
+            index for index in existing if index not in readiness_by_index
+        ]
+        if unprobed_existing:
             statuses = self._resolve_existing_readiness(
-                [keys[index] for index in existing]
+                [keys[index] for index in unprobed_existing]
             )
-            for index, status in zip(existing, statuses):
-                if status == "ready":
-                    ready_existing.append(index)
-                elif status == "missing":
-                    # The metadata disappeared while the duplicate gate was
-                    # polling; allow a fresh PutStart to take ownership.
-                    ordinary.append(index)
-                else:
-                    # PROCESSING, RPC failure, and timeout all fail closed.
-                    pass
+            for index, status in zip(unprobed_existing, statuses):
+                readiness_by_index[index] = status
+
+        for index in existing:
+            status = readiness_by_index.get(index, "processing")
+            if status == "ready":
+                ready_existing.append(index)
+            elif status == "missing":
+                # The metadata disappeared while the duplicate gate was
+                # polling; allow a fresh PutStart to take ownership.
+                ordinary.append(index)
+            else:
+                # PROCESSING, RPC failure, and timeout all fail closed.
+                pass
         result = failed[:]
 
         def invoke(indices, repair):
@@ -2045,10 +2089,31 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         try:
             ordinary_results = invoke(ordinary, False)
-            for index, value in zip(ordinary, ordinary_results):
-                # Overflow or a new failed read can arrive during native Put.
-                # Its zero status may mean duplicate/no-op, so recheck state.
-                if value == 0 and state.can_ack_existing(keys[index], failure_epoch):
+            successful_puts = [
+                index
+                for index, value in zip(ordinary, ordinary_results)
+                if value == 0
+            ]
+            # Another writer can win after our pre-Put OBJECT_NOT_FOUND
+            # observation. Native Put may then report zero for its duplicate
+            # no-op while that writer's DFS replica is still PROCESSING.
+            # Reuse the bounded readiness gate before acknowledging success;
+            # missing/unknown/timeout never starts a second Put or an Upsert.
+            post_put_statuses = []
+            if successful_puts:
+                try:
+                    post_put_statuses = self._resolve_existing_readiness(
+                        [keys[index] for index in successful_puts]
+                    )
+                except Exception:
+                    logger.warning(
+                        "DFS post-put readiness query raised; backup remains pending"
+                    )
+            for index, status in zip(successful_puts, post_put_statuses):
+                # Readiness alone cannot erase a newer local failure/overflow.
+                if status == "ready" and state.can_ack_existing(
+                    keys[index], failure_epoch
+                ):
                     result[index] = 0
             repair_indices = [index for index, _, _ in repairs]
             repair_results = invoke(repair_indices, True)
@@ -2072,13 +2137,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _resolve_existing_readiness(self, keys):
         """Wait for existing DFS keys to become readable COMPLETE objects.
 
-        ``batch_is_exist`` reports metadata presence, including PROCESSING
-        objects. The master admin endpoint is preferred because its
+        ``batch_is_exist`` reports readable COMPLETE replicas, not metadata
+        presence: zero cannot distinguish PROCESSING from OBJECT_NOT_FOUND.
+        The master admin endpoint is preferred because its
         ``/batch_query_keys`` path reads COMPLETE metadata without incrementing
         the ordinary ``BatchGetReplicaList`` failure counters. The native query
-        remains a compatibility fallback for older Mooncake builds. Missing
-        keys are rechecked with ``batch_is_exist`` so a key revoked during the
-        wait can be put again. Any unavailable probe fails closed.
+        remains a compatibility fallback for older Mooncake builds. Only an
+        explicit admin OBJECT_NOT_FOUND permits a new Put. Older builds that
+        cannot distinguish missing from unreadable keep such backups pending;
+        a strictly valid positive existence result can still prove readiness.
+        The existing bounded polling policy does not impose a hard RPC deadline.
         """
         if not keys:
             return []
@@ -2091,10 +2159,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         while pending:
             selected = [keys[index] for index in pending]
             replica_map = self._batch_readiness_probe(selected)
+            if not isinstance(replica_map, dict):
+                replica_map = None
             try:
                 exists = self._batch_exist(selected)
             except Exception:
-                exists = [1] * len(selected)
+                exists = None
+            if not isinstance(exists, (list, tuple)) or len(exists) != len(selected):
+                exists = [None] * len(selected)
+            else:
+                # Exceptions, malformed vectors and per-key error codes are
+                # unknown observations, never fabricated positive evidence.
+                exists = [
+                    value if type(value) is int and value in (0, 1) else None
+                    for value in exists
+                ]
 
             next_pending = []
             for local_index, index in enumerate(pending):
@@ -2104,19 +2183,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     # readable COMPLETE replica. Use it when the selected
                     # build has neither the admin endpoint nor the legacy
                     # replica-description API.
-                    if local_index < len(exists) and exists[local_index] == 1:
+                    if exists[local_index] == 1:
                         statuses[index] = "ready"
                     else:
-                        statuses[index] = "missing"
+                        statuses[index] = "processing"
+                        next_pending.append(index)
                     continue
-                if not isinstance(replica_map, dict):
-                    replica_map = {}
-                replicas = replica_map.get(key)
-                if isinstance(replicas, (list, tuple)) and replicas:
+                probe_state = replica_map.get(key)
+                # The admin endpoint returns explicit states for every key.
+                # These sentinels must take precedence over BatchExistKey: its
+                # false result is expected while a DFS descriptor is
+                # PROCESSING, and must never downgrade that state to missing.
+                if probe_state == self._DFS_READINESS_READY or (
+                    isinstance(probe_state, (list, tuple)) and probe_state
+                ):
                     statuses[index] = "ready"
-                elif local_index < len(exists) and exists[local_index] == 0:
+                elif probe_state == self._DFS_READINESS_MISSING:
                     statuses[index] = "missing"
+                elif probe_state in (
+                    self._DFS_READINESS_PROCESSING,
+                    self._DFS_READINESS_UNKNOWN,
+                ):
+                    statuses[index] = "processing"
+                    next_pending.append(index)
+                elif probe_state is None and exists[local_index] == 1:
+                    # A later positive Exist can establish readability even
+                    # when the legacy descriptor query omitted this key.
+                    statuses[index] = "ready"
                 else:
+                    # Legacy responses omit both absent and unreadable keys.
+                    # Exist=0 (or an unknown result) cannot authorize a new Put.
                     statuses[index] = "processing"
                     next_pending.append(index)
             pending = next_pending
@@ -2183,11 +2279,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             return None
-        return {
-            key: [True]
-            for key in keys
-            if isinstance(data.get(key), dict) and data[key].get("ok") is True
-        }
+        readiness = {}
+        for key in keys:
+            item = data.get(key)
+            if not isinstance(item, dict):
+                # A successful HTTP response with an incomplete per-key map is
+                # still not evidence that the object is missing. Preserve an
+                # explicit unknown state so the duplicate gate fails closed.
+                readiness[key] = self._DFS_READINESS_UNKNOWN
+                continue
+            if item.get("ok") is True:
+                readiness[key] = self._DFS_READINESS_READY
+                continue
+            error = str(item.get("error", "")).upper()
+            if error == "REPLICA_IS_NOT_READY":
+                readiness[key] = self._DFS_READINESS_PROCESSING
+            elif error == "OBJECT_NOT_FOUND":
+                readiness[key] = self._DFS_READINESS_MISSING
+            else:
+                readiness[key] = self._DFS_READINESS_UNKNOWN
+        return readiness
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]

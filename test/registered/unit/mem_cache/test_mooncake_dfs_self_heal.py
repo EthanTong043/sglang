@@ -239,6 +239,8 @@ class _Requests:
         cls.calls.append((url, kwargs))
         if cls.response is None:
             raise RuntimeError("admin probe not configured")
+        if callable(cls.response):
+            return cls.response(url, **kwargs)
         return cls.response
 
 
@@ -311,6 +313,27 @@ class TestMooncakeDfsSelfHeal(unittest.TestCase):
         store.prefetch_pgs = []
         store.prefetch_bandwidth = []
         store.gb_per_page = sum(parts) / (1 << 30)
+
+        def admin_response(url, **kwargs):
+            # The production admin path distinguishes missing from PROCESSING;
+            # legacy omitted-key/Exist=0 cannot. Normal byte-store scenarios
+            # model this explicit admin evidence. Fallback tests deliberately
+            # disable it rather than silently assuming zero means missing.
+            keys = kwargs["params"]["keys"].split(",")
+            readable = native.batch_get_replica_desc(keys)
+            data = {}
+            for key in keys:
+                if readable.get(key):
+                    data[key] = {"ok": True}
+                else:
+                    data[key] = {
+                        "ok": False,
+                        "error": "REPLICA_IS_NOT_READY" if key in native.objects else "OBJECT_NOT_FOUND",
+                    }
+            return _AdminResponse({"success": True, "data": data})
+
+        _Requests.response = admin_response
+        self.addCleanup(setattr, _Requests, "response", None)
         return store, native, memory
 
     @staticmethod
@@ -351,10 +374,443 @@ class TestMooncakeDfsSelfHeal(unittest.TestCase):
         finally:
             _Requests.response = None
 
-        self.assertEqual(result, {key: [True]})
+        self.assertEqual(result, {key: store._DFS_READINESS_READY})
         self.assertEqual(len(_Requests.calls), 1)
         self.assertEqual(
             _Requests.calls[0][0], "http://127.0.0.1:21203/batch_query_keys"
+        )
+
+    def test_admin_readiness_probe_preserves_processing_and_missing_states(self):
+        store, _, _ = self.fixture()
+        processing = self.key("v1", "processing-state")
+        missing = self.key("v1", "missing-state")
+        _Requests.response = _AdminResponse(
+            {
+                "success": True,
+                "data": {
+                    processing: {
+                        "ok": False,
+                        "error": "REPLICA_IS_NOT_READY",
+                    },
+                    missing: {"ok": False, "error": "OBJECT_NOT_FOUND"},
+                },
+            }
+        )
+        try:
+            result = store._batch_readiness_probe([processing, missing])
+        finally:
+            _Requests.response = None
+
+        self.assertEqual(result[processing], store._DFS_READINESS_PROCESSING)
+        self.assertEqual(result[missing], store._DFS_READINESS_MISSING)
+
+    def test_batch_exist_false_processing_admin_state_never_puts_v1_or_v2(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, _ = self.fixture()
+                key = self.key(kind, "processing-false")
+                native.seed(key, b"remote")
+                native.exists_override = lambda keys: [0] * len(keys)
+                _Requests.response = _AdminResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            key: {
+                                "ok": False,
+                                "error": "REPLICA_IS_NOT_READY",
+                            }
+                        },
+                    }
+                )
+                try:
+                    self.assertEqual(
+                        self.call(
+                            store,
+                            kind,
+                            "set",
+                            names=("processing-false",),
+                        ),
+                        [False],
+                    )
+                finally:
+                    _Requests.response = None
+                self.assertEqual(native.writes, [])
+
+    def test_batch_exist_false_complete_admin_state_is_idempotent_v1_or_v2(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, _ = self.fixture()
+                key = self.key(kind, "complete-false")
+                native.seed(key, b"remote")
+                native.exists_override = lambda keys: [0] * len(keys)
+                _Requests.response = _AdminResponse(
+                    {"success": True, "data": {key: {"ok": True}}}
+                )
+                try:
+                    self.assertEqual(
+                        self.call(
+                            store,
+                            kind,
+                            "set",
+                            names=("complete-false",),
+                        ),
+                        [True],
+                    )
+                finally:
+                    _Requests.response = None
+                self.assertEqual(native.writes, [])
+
+    def test_batch_exist_false_missing_admin_state_retries_put_v1_or_v2(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, _ = self.fixture()
+                key = self.key(kind, "missing-false")
+                native.exists_override = lambda keys: [0] * len(keys)
+                _Requests.response = _AdminResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            key: {"ok": False, "error": "OBJECT_NOT_FOUND"}
+                        },
+                    }
+                )
+                # The successful native Put makes this formerly missing key
+                # readable. Do not keep returning a stale missing response to
+                # the post-Put readiness check.
+                native.before_write = lambda call: setattr(
+                    _Requests,
+                    "response",
+                    _AdminResponse(
+                        {"success": True, "data": {key: {"ok": True}}}
+                    ),
+                )
+                try:
+                    self.assertEqual(
+                        self.call(
+                            store,
+                            kind,
+                            "set",
+                            names=("missing-false",),
+                        ),
+                        [True],
+                    )
+                finally:
+                    _Requests.response = None
+                self.assertEqual(
+                    [write["mode"] for write in native.writes], ["put"]
+                )
+
+    def post_put_race(self, kind, states, *, parts=(8,), dfs=True, native_results=None):
+        """Missing probe, competing writer, native duplicate-success, recheck.
+
+        The competing bytes are intentionally different from the local host
+        bytes. Put must preserve them; no test infers data corruption from a
+        duplicate error counter or from a failed readiness observation.
+        """
+        store, native, _ = self.fixture(parts, dfs=dfs)
+        store._DFS_DUPLICATE_READY_TIMEOUT_S = 0
+        names = tuple(states)
+        keys = [self.key(kind, name) for name in names]
+        events = []
+        entered_native = False
+        _Requests.calls = []
+        _Requests.response = _AdminResponse(
+            {"success": True, "data": {
+                key: {"ok": False, "error": "OBJECT_NOT_FOUND"} for key in keys
+            }}
+        )
+        self.addCleanup(setattr, _Requests, "response", None)
+        for index in range(len(names)):
+            self.pool(store, kind).fill(index * _HostPool.page_size, b"current!")
+
+        def exists(selected):
+            values = [int(entered_native and states[names[keys.index(key)]] == "ready")
+                      for key in selected]
+            events.append(("exists_after_native" if entered_native else "exists_before_native", values))
+            return values
+
+        def other_writer(call):
+            nonlocal entered_native
+            self.assertTrue(_Requests.calls or not dfs)
+            entered_native = True
+            errors = {"processing": "REPLICA_IS_NOT_READY", "missing": "OBJECT_NOT_FOUND",
+                      "unknown": "RPC_FAIL"}
+            data = {}
+            for name, key in zip(names, keys):
+                native.seed(key, b"foreign!")
+                state = states[name]
+                data[key] = {"ok": state == "ready", "error": errors.get(state)}
+            _Requests.response = _AdminResponse({"success": True, "data": data})
+            events.append(("competing_writer_before_native_return", list(call["keys"])))
+
+        def native_return(selected):
+            values = [0] * len(selected) if native_results is None else list(native_results)
+            events.append(("native_return", values))
+            return values
+
+        native.exists_override = exists
+        native.before_write = other_writer
+        native.write_override = native_return
+        return store, native, names, keys, events
+
+    def test_post_put_native_zero_processing_race_must_not_ack_v1_or_v2(self):
+        for kind in ("v1", "v2"):
+            for parts in ((8,), (3, 5)):
+                with self.subTest(kind=kind, parts=parts):
+                    store, native, names, keys, events = self.post_put_race(
+                        kind, {"raced": "processing"}, parts=parts
+                    )
+                    result = self.call(store, kind, "set", names)
+                    self.assertEqual(events[0], ("exists_before_native", [0]))
+                    self.assertIn(("competing_writer_before_native_return", keys), events)
+                    self.assertIn(("native_return", [0]), events)
+                    self.assertEqual(native.objects[keys[0]], b"foreign!")
+                    self.assertEqual(len(native.writes), 1)
+                    self.assertTrue(native.writes[0]["mode"].startswith("put"))
+                    self.assertEqual(result, [False], "native duplicate-success is not proof of COMPLETE")
+                    self.assert_pending(store, 0)
+
+    def test_post_put_missing_and_unknown_are_not_acknowledged_or_retried(self):
+        for kind in ("v1", "v2"):
+            for state in ("missing", "unknown"):
+                with self.subTest(kind=kind, state=state):
+                    store, native, names, keys, _ = self.post_put_race(kind, {"raced": state})
+                    self.assertEqual(self.call(store, kind, "set", names), [False])
+                    self.assertEqual(native.objects[keys[0]], b"foreign!")
+                    self.assertEqual([call["mode"] for call in native.writes], ["put"])
+
+    def test_post_put_ready_acknowledges_without_overwriting_other_writer(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(kind, {"raced": "ready"})
+                self.assertEqual(self.call(store, kind, "set", names), [True])
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(len(_Requests.calls), 2, "pre- and post-Put admin probes required")
+
+    def test_post_put_processing_waits_for_complete_without_second_put(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(kind, {"raced": "processing"})
+                store._DFS_DUPLICATE_READY_TIMEOUT_S = 0.05
+                original = store._batch_readiness_probe
+                observed = []
+
+                def probe(selected):
+                    result = original(selected)
+                    observed.append(result[keys[0]])
+                    if native.writes:
+                        _Requests.response = _AdminResponse(
+                            {"success": True, "data": {keys[0]: {"ok": True}}}
+                        )
+                    return result
+
+                store._batch_readiness_probe = probe
+                self.assertEqual(self.call(store, kind, "set", names), [True])
+                self.assertEqual(observed, [store._DFS_READINESS_MISSING,
+                                            store._DFS_READINESS_PROCESSING,
+                                            store._DFS_READINESS_READY])
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+
+    def test_post_put_mixed_results_keep_input_order_and_probe_only_native_success(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                states = {"ready": "ready", "wait": "processing", "gone": "missing",
+                          "unknown": "unknown", "failed": "ready"}
+                store, native, names, keys, _ = self.post_put_race(
+                    kind, states, native_results=[0, 0, 0, 0, -200]
+                )
+                result = self.call(store, kind, "set", names)
+                self.assertEqual(result, [True, False, False, False, False])
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(native.writes[0]["keys"], keys)
+                self.assertEqual(_Requests.calls[-1][1]["params"]["keys"].split(","), keys[:4])
+                self.assertTrue(all(native.objects[key] == b"foreign!" for key in keys))
+
+    def test_post_put_ready_does_not_hide_new_failure_epoch(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(kind, {"raced": "ready"})
+                original = store._batch_readiness_probe
+
+                def probe(selected):
+                    result = original(selected)
+                    if native.writes:
+                        store._record_failed_page_reads(keys, [7], [8])
+                    return result
+
+                store._batch_readiness_probe = probe
+                self.assertEqual(self.call(store, kind, "set", names), [False])
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+                self.assert_pending(store)
+
+    def test_non_dfs_native_zero_path_adds_no_readiness_probe(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(
+                    kind, {"raced": "processing"}, dfs=False
+                )
+                self.assertEqual(self.call(store, kind, "set", names), [True])
+                self.assertEqual(_Requests.calls, [])
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+
+    def test_post_put_all_native_failures_skip_confirmation(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(
+                    kind, {"raced": "ready"}, native_results=[-200]
+                )
+                self.assertEqual(self.call(store, kind, "set", names), [False])
+                self.assertEqual(len(_Requests.calls), 1)
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+
+    def test_post_put_probe_exception_preserves_independent_repair(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, _ = self.fixture()
+                self.mark_short(store, native, kind, ("repair",))
+                self.pool(store, kind).fill(0, b"correct!")
+                self.pool(store, kind).fill(_HostPool.page_size, b"new-data")
+                original = store._resolve_existing_readiness
+
+                def resolve(keys):
+                    if native.writes:
+                        raise RuntimeError("post-Put probe unavailable")
+                    return original(keys)
+
+                store._resolve_existing_readiness = resolve
+                self.assertEqual(
+                    self.call(store, kind, "set", ("repair", "ordinary")),
+                    [True, False],
+                )
+                self.assertEqual([call["mode"] for call in native.writes], ["put", "upsert"])
+                self.assertEqual(native.objects[self.key(kind, "repair")], b"correct!")
+                self.assertEqual(native.objects[self.key(kind, "ordinary")], b"new-data")
+                self.assert_pending(store, 0)
+
+    def test_post_put_repair_only_batch_adds_no_confirmation(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, _ = self.fixture()
+                self.mark_short(store, native, kind)
+                self.pool(store, kind).fill(0, b"correct!")
+                _Requests.calls = []
+                self.assertEqual(self.call(store, kind, "set"), [True])
+                self.assertEqual(_Requests.calls, [])
+                self.assertEqual([call["mode"] for call in native.writes], ["upsert"])
+                self.assert_pending(store, 0)
+
+    def test_post_put_admin_unavailable_and_exists_exception_never_ack(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, events = self.post_put_race(
+                    kind, {"raced": "processing"}
+                )
+                native.batch_get_replica_desc = None
+                other_writer = native.before_write
+
+                def unavailable_exists(selected):
+                    raise RuntimeError("Exist RPC failed after native duplicate-success")
+
+                def race_and_lose_observation(call):
+                    other_writer(call)
+                    _Requests.response = None
+                    native.exists_override = unavailable_exists
+
+                native.before_write = race_and_lose_observation
+                result = self.call(store, kind, "set", names)
+                self.assertIn(("native_return", [0]), events)
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+                self.assertEqual(len(native.writes), 1)
+                self.assertEqual(result, [False], "failed Exist RPC is not readable evidence")
+
+    def test_fallback_exist_zero_never_authorizes_a_new_put(self):
+        for kind in ("v1", "v2"):
+            for legacy_api in (False, True):
+                with self.subTest(kind=kind, legacy_api=legacy_api):
+                    store, native, _ = self.fixture()
+                    store._DFS_DUPLICATE_READY_TIMEOUT_S = 0
+                    _Requests.response = None
+                    self.addCleanup(setattr, _Requests, "response", None)
+                    if not legacy_api:
+                        native.batch_get_replica_desc = None
+                    else:
+                        native.readiness_override = lambda keys: {}
+                    native.exists_override = lambda keys: [0] * len(keys)
+                    result = self.call(store, kind, "set")
+                    self.assertEqual(native.writes, [], "Exist=0 does not prove OBJECT_NOT_FOUND")
+                    self.assertEqual(result, [False])
+
+    def test_fallback_unknown_exists_is_pending_not_missing_or_ready(self):
+        for legacy_api in (False, True):
+            for response in (None, [], [1, 1], True, [True], [1.0], [-200], ["1"], [0]):
+                with self.subTest(legacy_api=legacy_api, response=response):
+                    store, native, _ = self.fixture()
+                    store._DFS_DUPLICATE_READY_TIMEOUT_S = 0
+                    _Requests.response = None
+                    self.addCleanup(setattr, _Requests, "response", None)
+                    if not legacy_api:
+                        native.batch_get_replica_desc = None
+                    else:
+                        native.readiness_override = lambda keys: {}
+                    native.exists_override = lambda keys, result=response: result
+                    self.assertEqual(
+                        store._resolve_existing_readiness([self.key("v1")]),
+                        ["processing"],
+                    )
+
+    def test_fallback_known_positive_exists_is_readable_with_or_without_legacy_api(self):
+        for kind in ("v1", "v2"):
+            for legacy_api in (False, True):
+                with self.subTest(kind=kind, legacy_api=legacy_api):
+                    store, native, names, keys, _ = self.post_put_race(kind, {"raced": "ready"})
+                    if legacy_api:
+                        native.readiness_override = lambda selected: {}
+                    else:
+                        native.batch_get_replica_desc = None
+                    other_writer = native.before_write
+
+                    def race_and_use_exists(call):
+                        other_writer(call)
+                        _Requests.response = None
+                        native.exists_override = lambda selected: [1] * len(selected)
+
+                    native.before_write = race_and_use_exists
+                    self.assertEqual(self.call(store, kind, "set", names), [True])
+                    self.assertEqual(native.objects[keys[0]], b"foreign!")
+                    self.assertEqual(len(native.writes), 1)
+
+    def test_admin_explicit_ready_survives_exists_rpc_failure(self):
+        for kind in ("v1", "v2"):
+            with self.subTest(kind=kind):
+                store, native, names, keys, _ = self.post_put_race(kind, {"raced": "ready"})
+                other_writer = native.before_write
+
+                def failed_exists(selected):
+                    raise RuntimeError("Exist RPC failed independently of admin")
+
+                def race_with_admin_ready(call):
+                    other_writer(call)
+                    native.exists_override = failed_exists
+
+                native.before_write = race_with_admin_ready
+                self.assertEqual(self.call(store, kind, "set", names), [True])
+                self.assertEqual(native.objects[keys[0]], b"foreign!")
+                self.assertEqual(len(native.writes), 1)
+
+    def test_fallback_mixed_positive_and_error_exists_keeps_per_key_results(self):
+        store, native, _ = self.fixture()
+        store._DFS_DUPLICATE_READY_TIMEOUT_S = 0
+        native.batch_get_replica_desc = None
+        native.exists_override = lambda keys: [1, -200]
+        _Requests.response = None
+        self.assertEqual(
+            store._resolve_existing_readiness([self.key("v1", "ready"), self.key("v1", "unknown")]),
+            ["ready", "processing"],
         )
 
     def mark_short(self, store, native, kind, names=("a",)):
@@ -1037,14 +1493,21 @@ class TestMooncakeDfsSelfHeal(unittest.TestCase):
 
         def revoked(keys):
             exists_calls.append(list(keys))
-            return [1] * len(keys) if len(exists_calls) == 1 else [0] * len(keys)
+            if len(exists_calls) == 2:
+                # Revoke the modeled object, not only the existence response.
+                # The subsequent successful Put creates a readable replacement.
+                native.objects.pop(key, None)
+                native.checksums.pop(key, None)
+            return [int(item in native.objects) for item in keys]
 
         native.exists_override = revoked
+        native.before_write = lambda call: setattr(native, "readiness_override", None)
         pointers, sizes = self.pool(store, "v1").get_page_buffer_meta([0])
         self.pool(store, "v1").fill(0, b"current!")
 
         self.assertTrue(store.set(key, target_location=pointers, target_sizes=sizes))
         self.assertEqual([write["mode"] for write in native.writes], ["put_multi"])
+        self.assertEqual(native.objects[key], b"current!")
 
 
 if __name__ == "__main__":
