@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -26,14 +27,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
-from sglang.srt.runtime_context import (
-    exports_expert_balancedness_to_prometheus,
-    get_context,
-    get_disagg,
-    get_observability,
-    get_schedule,
-    get_serving,
-)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
@@ -205,16 +198,15 @@ STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
 STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
 
 
-def resolve_collector_class(role: str, default_cls: type) -> type:
-    """Return the subclass registered for `role` in the published
-    ``observability`` bag, or `default_cls` if none is registered.
-
-    An unpublished ``observability`` namespace answers with the default.
-    """
-
-    if not get_context().is_config_namespace_published("observability"):
+def resolve_collector_class(
+    server_args: Optional[ServerArgs], role: str, default_cls: type
+) -> type:
+    """Return the subclass registered for `role` on `server_args.stat_loggers`,
+    or `default_cls` if none is registered. Tolerates `server_args=None` and
+    `stat_loggers=None`."""
+    if server_args is None:
         return default_cls
-    stat_loggers = get_observability().stat_loggers
+    stat_loggers = getattr(server_args, "stat_loggers", None)
     if not stat_loggers:
         return default_cls
     return stat_loggers.get(role, default_cls)
@@ -270,6 +262,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
+        self._init_allocator_observation(Gauge)
 
         # =================================================================
         # Basics
@@ -880,7 +873,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Execution
         # =================================================================
-        if labels["moe_ep_rank"] == 0 and exports_expert_balancedness_to_prometheus():
+        if (
+            labels["moe_ep_rank"] == 0
+            and server_args.should_export_expert_balancedness_to_prometheus()
+        ):
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
@@ -963,7 +959,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Prefill delayer
         # =================================================================
-        max_delay = get_schedule().prefill_delayer_max_delay_passes
+        max_delay = server_args.prefill_delayer_max_delay_passes
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
@@ -972,7 +968,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 set(
                     x
                     for x in (
-                        get_schedule().prefill_delayer_forward_passes_buckets
+                        server_args.prefill_delayer_forward_passes_buckets
                         or [5, 20, 50, 100, 200]
                     )
                     if x < max_delay
@@ -987,7 +983,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=sorted(
                 set(
-                    get_schedule().prefill_delayer_wait_seconds_buckets
+                    server_args.prefill_delayer_wait_seconds_buckets
                     or [1, 2, 5, 10, 20, 50, 100, 200, 500]
                 )
                 # Need bucket "<=0" for zero-delay cases
@@ -1083,14 +1079,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
-        enable_metrics = get_observability().enable_metrics
+        enable_metrics = server_args.enable_metrics
         is_stats_logging_rank = ps.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
-            is_stats_logging_rank
-            or get_observability().enable_metrics_for_all_schedulers
+            is_stats_logging_rank or server_args.enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
-            get_observability().kv_events_config
+            server_args.kv_events_config
             and ps.pp_rank == 0
             and ps.attn_tp_rank == 0
             and ps.attn_cp_rank == 0
@@ -1098,10 +1093,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+                server_args.disaggregation_mode
             )
             labels = {
-                "model_name": get_serving().served_model_name,
+                "model_name": server_args.served_model_name,
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
@@ -1111,18 +1106,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labels["priority"] = ""
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            if get_observability().extra_metric_labels:
-                labels.update(get_observability().extra_metric_labels)
+            if server_args.extra_metric_labels:
+                labels.update(server_args.extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
-                STAT_LOGGER_ROLE_SCHEDULER, cls
+                server_args, STAT_LOGGER_ROLE_SCHEDULER, cls
             )
             collector = scheduler_collector_cls(
                 labels=labels,
                 enable_lora=enable_lora,
                 enable_hierarchical_cache=enable_hierarchical_cache,
-                enable_streaming_session=get_serving().enable_streaming_session,
+                enable_streaming_session=server_args.enable_streaming_session,
                 server_args=server_args,
             )
+            # Save identity only; CUDA is initialized later by ModelRunner.
+            collector._allocator_device = ps.gpu_id
         return SchedulerMetricsCollectorContext(
             enable_metrics=enable_metrics,
             is_stats_logging_rank=is_stats_logging_rank,
@@ -1322,7 +1319,88 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 num_write_bytes_per_gpu
             )
 
+
+    def _init_allocator_observation(self, Gauge):
+        # Called before ModelRunner selects/initializes CUDA. Gauges only here.
+        self._allocator_device = None
+        self._allocator_next_sample = 0.0
+        self._allocator_error_count = 0
+        base = list(self.labels)
+        def gauge(name, help_text, extra=()):
+            return Gauge(name="sglang:" + name, documentation=help_text,
+                         labelnames=base + list(extra), multiprocess_mode="mostrecent")
+        self._allocator_bytes = gauge("torch_allocator_bytes",
+            "Process-local native PyTorch allocator bytes; mask by observation availability and timestamp. Not all CUDA allocations.", ("stat",))
+        self._allocator_events = gauge("torch_allocator_events",
+            "Observed cumulative native PyTorch allocator event counts; can reset and do not count all CUDA failures.", ("event",))
+        self._allocator_identity = gauge("torch_allocator_observer_info",
+            "Observer process PID in its namespace, explicit scheduler CUDA device, and allocator backend.", ("pid", "device", "backend"))
+        self._allocator_available = gauge("torch_allocator_observation_available",
+            "1 only after a successful supported sample; 0 means unknown/unavailable, not zero memory.")
+        self._allocator_timestamp = gauge("torch_allocator_last_success_timestamp_seconds",
+            "Unix time of the last successful allocator sample; values may remain after a failed sample.")
+        self._allocator_duration = gauge("torch_allocator_observation_duration_seconds",
+            "CPU wall duration of the most recent observation; no explicit device synchronization.")
+        self._allocator_errors = gauge("torch_allocator_observation_errors",
+            "Observed exception count in passive allocator sampling; diagnostic only.")
+
+    def _observe_allocator(self):
+        now = time.monotonic()
+        if now < self._allocator_next_sample:
+            return
+        self._allocator_next_sample = now + 5.0
+        started = time.perf_counter()
+        try:
+            self._allocator_available.labels(**self.labels).set(0)
+            if self._allocator_device is None:
+                return
+            import torch
+            # No lazy CUDA initialization, device switch, allocation, cache clear,
+            # reset, snapshot, explicit sync, thread or collective is performed.
+            if not torch.cuda.is_initialized():
+                return
+            backend = torch.cuda.get_allocator_backend()
+            backend_label = backend if backend in ("native", "cudaMallocAsync") else "other"
+            self._allocator_identity.labels(**self.labels, pid=str(os.getpid()),
+                device=str(self._allocator_device), backend=backend_label).set(1)
+            if backend != "native":
+                return  # These stats have different/unsupported async semantics.
+            stats = torch.cuda.memory_stats(self._allocator_device)
+            byte_keys = {
+                "allocated": "allocated_bytes.all.current",
+                "reserved": "reserved_bytes.all.current",
+                "active": "active_bytes.all.current",
+                "inactive_split": "inactive_split_bytes.all.current",
+                "requested": "requested_bytes.all.current",
+                "allocated_peak": "allocated_bytes.all.peak",
+                "reserved_peak": "reserved_bytes.all.peak",
+            }
+            event_keys = {"ooms": "num_ooms", "allocation_retries": "num_alloc_retries"}
+            values = {key: stats[key] for key in (*byte_keys.values(), *event_keys.values())}
+            if any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) or value < 0 for value in values.values()):
+                raise ValueError("invalid allocator observation")
+            for name, key in byte_keys.items():
+                self._allocator_bytes.labels(**self.labels, stat=name).set(values[key])
+            for name, key in event_keys.items():
+                self._allocator_events.labels(**self.labels, event=name).set(values[key])
+            self._allocator_timestamp.labels(**self.labels).set(time.time())
+            self._allocator_available.labels(**self.labels).set(1)
+        except Exception:
+            self._allocator_error_count += 1
+            try:
+                self._allocator_available.labels(**self.labels).set(0)
+                self._allocator_errors.labels(**self.labels).set(self._allocator_error_count)
+            except Exception:
+                pass  # Observation must not terminate the serving scheduler.
+        finally:
+            try:
+                self._allocator_duration.labels(**self.labels).set(time.perf_counter() - started)
+            except Exception:
+                pass
+
     def log_stats(self, stats: SchedulerStats) -> None:
+        self._observe_allocator()
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
@@ -1575,7 +1653,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                get_observability().prompt_tokens_buckets, default_bucket_prompt_tokens
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
         self.uncached_prompt_tokens_histogram = Histogram(
@@ -1583,7 +1661,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of uncached (compute) prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                get_observability().prompt_tokens_buckets, default_bucket_prompt_tokens
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
         self.generation_tokens_histogram = Histogram(
@@ -1591,7 +1669,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of generation token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                get_observability().generation_tokens_buckets,
+                server_args.generation_tokens_buckets,
                 default_bucket_prompt_tokens,
             ),
         )
@@ -1859,11 +1937,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         labels: Dict[str, str],
     ):
         from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1876,117 +1952,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
-            documentation="Number of tokens that completed the host-to-storage "
-            "(L2->L4) write, i.e. StorageOperation.completed_tokens summed at "
-            "backup-ack drain. This is the ACCEPTANCE-RATE NUMERATOR. Distinct "
-            "from the device-to-host (L1->L2) sglang:hicache_backup_tokens_total.",
-            labelnames=labels.keys(),
-        )
-
-        # ↓↓↓ L4(L2→storage)写侧埋点。为什么加在 StorageMetricsCollector 上:
-        # 它是唯一在 L4 写路径上可达、且已持有 storage 标签(storage_backend/
-        # tp_rank/dp_rank/...)的 collector。承接率的分子分母必须同 collector、
-        # 同标签、同进程,否则跨 collector 相除会因标签集不同而无法对齐
-        # (RadixCacheMetricsCollector 只有 cache_type/pool,没有 tp_rank)。
-        self.storage_write_submitted_tokens_total = Counter(
-            name="sglang:hicache_storage_write_submitted_tokens_total",
-            documentation="Tokens ENQUEUED for the host-to-storage (L2->L4) "
-            "write, counted at submission before any IO. Pairs with "
-            "sglang:backuped_tokens_total (completed): submitted minus "
-            "completed is in-flight plus silently-lost work. A nonzero "
-            "submitted with a zero completed rate is the signature of the "
-            "historical store-client failure where pushes were discarded "
-            "silently and every *_failed_total stayed at 0.",
-            labelnames=labels.keys(),
-        )
-
-        self.storage_write_submitted_bytes_total = Counter(
-            name="sglang:hicache_storage_write_submitted_bytes_total",
-            documentation="Bytes enqueued for the host-to-storage (L2->L4) "
-            "write: tokens * storage_host_pool.size_per_token, the KV payload "
-            "only (sidecar/aux pools excluded). Kept as a SEPARATE counter "
-            "rather than derived from the token counter — the two have "
-            "different denominators and dividing them is meaningless.",
-            labelnames=labels.keys(),
-        )
-        # Materialize zero-valued source counters as soon as the storage
-        # collector exists.  This distinguishes healthy 100% completion,
-        # all-failed 0% completion, and an unregistered/disabled collector;
-        # no histogram observation is created by this initialization.
-        for _counter in (
-            self.storage_write_submitted_tokens_total,
-            self.storage_write_submitted_bytes_total,
-            self.backuped_tokens_total,
-        ):
-            _counter.labels(**self.labels)
-
-        self.storage_write_failed_tokens_total = Counter(
-            name="sglang:hicache_storage_write_failed_tokens_total",
-            documentation="Tokens that were submitted for the L2->L4 write but "
-            "did not complete, by reason. batch_rejected: the storage backend "
-            "returned a falsy batch result, so _page_backup aborted and the "
-            "remaining pages of that operation were never attempted "
-            "(this is the count those pages would have contributed). "
-            "backend_exception: the backend raised and the backup daemon "
-            "unwound. NOTE: the Mooncake backend collapses its per-object "
-            "native int error codes to a single bool before the controller "
-            "sees them, so alloc-failure / IO-error / timeout are NOT "
-            "distinguishable at this layer — see the README of experiment "
-            "05-l4-write-metrics.",
-            labelnames=list(labels.keys()) + ["reason"],
-        )
-        # Materialize the two stable failure-reason children at collector
-        # creation.  Prometheus otherwise omits a Counter child until the
-        # first failure event, making a healthy run (submitted == completed,
-        # zero failures) indistinguishable from a collector that was never
-        # registered.  The collector itself is still absent when storage
-        # metrics are disabled, so the query layer can keep that distinction.
-        for _reason in ("batch_rejected", "backend_exception"):
-            self.storage_write_failed_tokens_total.labels(
-                **self.labels, reason=_reason
-            )
-        self.storage_write_sidecar_failed_operations_total = Counter(
-            name="sglang:hicache_storage_write_sidecar_failed_operations_total",
-            documentation="Hybrid sidecar backup operations with a rejected or exceptional pool result.",
-            labelnames=list(labels.keys()) + ["pool", "reason"],
-        )
-
-        self.storage_write_duration_seconds = Histogram(
-            name="sglang:hicache_storage_write_duration_seconds",
-            documentation="Wall time of one host-to-storage (L2->L4) backup "
-            "operation, measured around the backend batch-write call in the "
-            "backup daemon thread. Divided into the submitted-bytes rate it "
-            "gives achieved L2->L4 write bandwidth.",
-            labelnames=labels.keys(),
-            buckets=[
-                0.001,
-                0.005,
-                0.01,
-                0.05,
-                0.1,
-                0.25,
-                0.5,
-                1.0,
-                2.5,
-                5.0,
-                10.0,
-                30.0,
-                60.0,
-            ],
-        )
-
-        self.backup_dropped_tokens_total = Counter(
-            name="sglang:hicache_backup_dropped_tokens_total",
-            documentation="Buffer-mode backup tokens dropped by write-path rate "
-            "limiting (backlog cap or dropped-parent cascade).",
-            labelnames=labels.keys(),
-        )
-
-        self.prefetch_aux_alloc_failed_tokens_total = Counter(
-            name="sglang:hicache_prefetch_aux_alloc_failed_tokens_total",
-            documentation="Prefetch tokens abandoned because an aux pool "
-            "(e.g. the SWA trailing window) could not allocate host staging "
-            "— the whole storage fetch is forfeited, not just the aux part.",
+            documentation="Number of backuped tokens.",
             labelnames=labels.keys(),
         )
 
@@ -2043,49 +2009,6 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
-
-    # ---- L4(L2→storage)写侧 ----
-    # 语义约定:submitted 在入队处记一次,completed(log_backuped_tokens)在
-    # ack 处记一次,failed 在失败可被观测到的地方按原因记。三者同标签,
-    # 因此 submitted - completed - failed 可作为"在飞 + 静默丢失"的残差。
-
-    def log_storage_write_submitted(self, num_tokens: int, num_bytes: int):
-        """L4 写入提交量。token 与 byte 分开上报,口径不同不可互推。"""
-        if num_tokens > 0:
-            self.storage_write_submitted_tokens_total.labels(**self.labels).inc(
-                num_tokens
-            )
-        if num_bytes > 0:
-            self.storage_write_submitted_bytes_total.labels(**self.labels).inc(
-                num_bytes
-            )
-
-    def log_storage_write_failed_tokens(self, num_tokens: int, reason: str):
-        """L4 写失败量,按原因分类。reason 取值见 counter documentation。"""
-        if num_tokens > 0:
-            self.storage_write_failed_tokens_total.labels(
-                **self.labels, reason=reason
-            ).inc(num_tokens)
-
-    def log_storage_write_sidecar_failure(self, pool: str, reason: str):
-        self.storage_write_sidecar_failed_operations_total.labels(
-            **self.labels, pool=pool, reason=reason
-        ).inc()
-
-    def observe_storage_write_duration(self, duration_seconds: float):
-        self.storage_write_duration_seconds.labels(**self.labels).observe(
-            duration_seconds
-        )
-
-    def log_backup_dropped_tokens(self, dropped_tokens: int):
-        if dropped_tokens > 0:
-            self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
-
-    def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
-        if num_tokens > 0:
-            self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
-                num_tokens
-            )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -2209,6 +2132,25 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             60.0,
         ]
 
+        self.host_reclaimed_slots = Counter(
+            name="sglang:hicache_host_reclaimed_slots_total",
+            documentation="Actual host slots released by completed tree component frees. "
+            "reason=host_pressure covers evict_host; tree_cleanup covers other "
+            "_free_values callers. unit=token for KV/SWA, state for Mamba; "
+            "INDEXER shared_token is logical invalidation using the KV anchor "
+            "indices, not an additional allocator free or distinct token capacity.",
+            labelnames=list(labels.keys()) + ["pool", "unit", "reason"],
+        )
+        self.host_eviction_duration_seconds = Histogram(
+            name="sglang:hicache_host_eviction_duration_seconds",
+            documentation="Wall time of one evict_host attempt, including the "
+            "tree walk and frees. Count is attempts, including empty/error; "
+            "requested_pool identifies the trigger, reclaimed slots identify "
+            "every affected pool. Not a count of evicted radix nodes.",
+            labelnames=list(labels.keys()) + ["requested_pool", "outcome"],
+            buckets=bucket_eviction_duration,
+        )
+
         self.eviction_duration_seconds = Histogram(
             name="sglang:eviction_duration_seconds",
             documentation="End-to-end time of a device eviction pass in "
@@ -2284,14 +2226,35 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens = Counter(
             name="sglang:hicache_dropped_tokens_total",
             documentation="The number of device KV tokens destroyed without a "
-            "host backup, by pool (kv, swa, ...) and reason: host_pressure "
-            "(write-back backup failure under host memory pressure), "
-            "below_write_threshold (evicted before reaching "
-            "--hicache-write-policy's write-through hit threshold, so no "
-            "backup was ever started), never_backuped (threshold reached but "
-            "the backup did not land).",
+            "host backup, by pool (kv, swa, ...) and reason (e.g. write-back "
+            "backup failure under host memory pressure).",
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
+
+    def init_host_reclamation_pool(self, pool: str, unit: str) -> None:
+        for reason in ("host_pressure", "tree_cleanup"):
+            self.host_reclaimed_slots.labels(
+                **self.labels, pool=pool, unit=unit, reason=reason
+            ).inc(0)
+        if unit != "shared_token":
+            for outcome in ("evicted", "empty", "error"):
+                self.host_eviction_duration_seconds.labels(
+                    **self.labels, requested_pool=pool, outcome=outcome
+                )
+
+    def increment_host_reclaimed_slots(
+        self, num_slots: int, pool: str, unit: str, reason: str
+    ) -> None:
+        self.host_reclaimed_slots.labels(
+            **self.labels, pool=pool, unit=unit, reason=reason
+        ).inc(num_slots)
+
+    def observe_host_eviction_duration(
+        self, duration_seconds: float, requested_pool: str, outcome: str
+    ) -> None:
+        self.host_eviction_duration_seconds.labels(
+            **self.labels, requested_pool=requested_pool, outcome=outcome
+        ).observe(duration_seconds)
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
