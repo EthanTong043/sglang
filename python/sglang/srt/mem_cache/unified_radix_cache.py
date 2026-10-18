@@ -1952,6 +1952,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if entry is not None:
                     node_id, lock_params = entry
                     self.dec_host_lock_ref(node_id, lock_params)
+                record_ack = getattr(
+                    getattr(cc, "storage_backend", None),
+                    "record_backup_ack_drained",
+                    None,
+                )
+                if record_ack is not None:
+                    record_ack(operation)
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -2168,7 +2175,16 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
+        ack_sync_started = time.perf_counter()
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        if self.enable_storage:
+            record_sync = getattr(
+                getattr(cc, "storage_backend", None),
+                "record_backup_ack_collective",
+                None,
+            )
+            if record_sync is not None:
+                record_sync(time.perf_counter() - ack_sync_started)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert (

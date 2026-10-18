@@ -25,7 +25,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import (
+    STORAGE_WRITE_LATENCY_BUCKETS,
+    StorageMetrics,
+)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -104,6 +107,141 @@ def _parse_bool(value, name: str) -> bool:
         if normalized in ("0", "false", "no", "n"):
             return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def _resolve_dfs_writer_slot(storage_config, *, enabled, prefill_index, role):
+    """Bind only an explicitly identified CP4 Prefill to a lifecycle slot.
+
+    An inherited feature flag without a Prefill index does not make a Decode
+    or an auxiliary reader a writer. Conversely a Prefill must never silently
+    fall back to an unregistered writer when the new placement is requested.
+    """
+    if not enabled:
+        return None
+    if prefill_index is None:
+        if role == "prefill":
+            raise ValueError(
+                "DFS batch placement Prefill requires MOONCAKE_DFS_PREFILL_INDEX"
+            )
+        return None
+    if role != "prefill":
+        raise ValueError(
+            "MOONCAKE_DFS_PREFILL_INDEX is valid only for a Prefill writer"
+        )
+    try:
+        index = int(prefill_index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MOONCAKE_DFS_PREFILL_INDEX must be an integer in [0, 9]"
+        ) from exc
+    if not 0 <= index < 10:
+        raise ValueError("MOONCAKE_DFS_PREFILL_INDEX must be in [0, 9]")
+    if storage_config is None:
+        raise ValueError(
+            "DFS batch placement requires explicit storage rank configuration"
+        )
+    cp_size = storage_config.attn_cp_size
+    cp_rank = storage_config.attn_cp_rank
+    if cp_size != 4 or type(cp_rank) is not int or not 0 <= cp_rank < 4:
+        raise ValueError(
+            "DFS batch placement requires attn_cp_size=4 and CP rank in [0, 3]"
+        )
+    if storage_config.tp_size != 4 or storage_config.tp_rank != cp_rank:
+        raise ValueError(
+            "DFS batch placement requires TP4 with exactly one TP rank per CP rank"
+        )
+    if storage_config.pp_size != 1 or storage_config.pp_rank != 0:
+        raise ValueError(
+            "DFS batch placement v5 does not support pipeline parallel writers"
+        )
+    if not getattr(storage_config, "layer_sharded", False):
+        raise ValueError("DFS batch placement v5 requires layer-sharded KV ownership")
+    return index * cp_size + cp_rank
+
+
+class _DfsWriteMetrics:
+    """Bounded aggregate deltas shared by scheduler and storage threads.
+
+    Only finite pool/event/phase names supplied by this module are accepted.
+    No keys, batch IDs, pointers, or per-object samples are retained. Values
+    describe application work; native I/O/publication bytes have separate
+    counters in Mooncake and must not be inferred from these payload counters.
+    """
+
+    POOLS = frozenset(str(pool.value) for pool in PoolName) | {"all", "other"}
+    EVENTS = frozenset(
+        (
+            "queued", "started", "local_completed", "local_failed", "ack_drained",
+            "batch_submitted", "batch_completed", "batch_failed",
+            "put_submitted", "put_returned_success", "put_failed",
+            "repair_submitted", "repair_returned_success", "repair_failed",
+            "duplicate_ready", "readiness_timeout",
+        )
+    )
+    PHASES = frozenset(
+        (
+            "queue", "operation", "ack_wait", "batch", "native_put", "native_repair",
+            "readiness", "readiness_http", "readiness_native_exist",
+            "readiness_native_desc", "readiness_sleep", "existence", "cp_ack_collective",
+        )
+    )
+    STATES = frozenset(("queued", "active", "awaiting_ack", "failed_no_ack"))
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counters = {}
+        self._timings = {}
+        self._pending = {}
+
+    def record(
+        self, pool, event=None, *, operations=0, tokens=0, objects=0,
+        payload_bytes=0, phase=None, duration=None, pending=None,
+    ):
+        pool = str(getattr(pool, "value", pool))
+        pool = pool if pool in self.POOLS else "other"
+        if event is not None and event not in self.EVENTS:
+            raise ValueError(f"Unknown DFS application metric event: {event}")
+        if phase is not None and phase not in self.PHASES:
+            raise ValueError(f"Unknown DFS application metric phase: {phase}")
+        with self._lock:
+            if event is not None:
+                for unit, value in (
+                    ("operations", operations), ("tokens", tokens),
+                    ("objects", objects), ("payload_bytes", payload_bytes),
+                ):
+                    key = (pool, event, unit)
+                    self._counters[key] = self._counters.get(key, 0) + value
+            if phase is not None and duration is not None:
+                key = (pool, phase)
+                sample = self._timings.setdefault(
+                    key, [0, 0.0, [0] * (len(STORAGE_WRITE_LATENCY_BUCKETS) + 1)]
+                )
+                duration = max(0.0, duration)
+                sample[0] += 1
+                sample[1] += duration
+                for index, bound in enumerate(
+                    (*STORAGE_WRITE_LATENCY_BUCKETS, float("inf"))
+                ):
+                    if duration <= bound:
+                        sample[2][index] += 1
+                        break
+            for state, op_delta, token_delta in pending or ():
+                if state not in self.STATES:
+                    raise ValueError(f"Unknown DFS application pending state: {state}")
+                for unit, delta in (("operations", op_delta), ("tokens", token_delta)):
+                    key = (pool, state, unit)
+                    self._pending[key] = self._pending.get(key, 0) + delta
+
+    def snapshot(self):
+        with self._lock:
+            result = {
+                "counters": self._counters,
+                "timings": self._timings,
+                "pending": dict(self._pending),
+            }
+            self._counters = {}
+            self._timings = {}
+            return result
 
 
 @dataclass
@@ -660,7 +798,49 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
+            self._initialize_storage_identity(storage_config)
+            self._dfs_writer_slot = None
+            self._dfs_client_metrics_port = None
+            self._dfs_batch_reader_only = False
+            placement_enabled = _parse_bool(
+                os.getenv("MOONCAKE_DFS_BATCH_PLACEMENT", "0"),
+                "MOONCAKE_DFS_BATCH_PLACEMENT",
+            )
+            prefill_index = os.getenv("MOONCAKE_DFS_PREFILL_INDEX")
+            metrics_base = os.getenv("MOONCAKE_DFS_CLIENT_METRICS_PORT_BASE")
+            # Instrumented baseline needs the same forty native endpoints
+            # while placement is off. Metrics admission still verifies an
+            # explicit Prefill CP4 identity; it never registers a writer slot.
+            if placement_enabled or (metrics_base is not None and prefill_index is not None):
+                # The deployment index is not a substitute for the actual
+                # process role. Runtime context is already published before
+                # controller/storage construction; fail closed if unavailable.
+                from sglang.srt.runtime_context import get_disagg
+
+                role = get_disagg().disaggregation_mode
+                identity_slot = _resolve_dfs_writer_slot(
+                    storage_config,
+                    enabled=True,
+                    prefill_index=prefill_index,
+                    role=role,
+                )
+                if placement_enabled:
+                    self._dfs_writer_slot = identity_slot
+                    self._dfs_batch_reader_only = identity_slot is None
+                if identity_slot is not None and not (
+                    self.config.dfs_only and self.config.dfs_replica_num == 1
+                ):
+                    raise ValueError("DFS batch placement v5 requires DFS-only storage")
+                if metrics_base is not None and identity_slot is not None:
+                    base = int(metrics_base)
+                    if not 1 <= base <= 65532:
+                        raise ValueError("DFS client metrics base must allow four ports in [1, 65535]")
+                    self._dfs_client_metrics_port = base + self.attn_cp_rank
             self._dfs_only = bool(self.config.dfs_only)
+            self._dfs_write_metrics = (
+                _DfsWriteMetrics() if self.enable_storage_metrics and self._dfs_only else None
+            )
+            self._dfs_metric_context = threading.local()
             self._effective_replica_num = self.config.effective_replica_num()
             if self._dfs_only:
                 if self.config.dfs_replica_num != 1:
@@ -856,6 +1036,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
+                if self._dfs_client_metrics_port is not None:
+                    setup_kwargs["enable_client_http_server"] = True
+                    setup_kwargs["client_http_port"] = self._dfs_client_metrics_port
 
                 while True:
                     try:
@@ -877,6 +1060,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if any(key in ("enable_client_http_server", "client_http_port")
+                               for key in unsupported_kwargs):
+                            raise RuntimeError(
+                                "Requested DFS client metrics require a compatible native HTTP binding"
+                            ) from e
                         if self._dfs_only and any(
                             key in ("enable_ssd_offload", "ssd_offload_path")
                             for key in unsupported_kwargs
@@ -906,39 +1094,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
-            self.local_rank = (
-                storage_config.tp_rank if storage_config is not None else 0
-            )
-            self.warmup()
-            logger.info("Mooncake store warmup successfully.")
-
-            self.enable_storage_metrics = False
-            if storage_config is not None:
-                self.is_mla_backend = storage_config.is_mla_model
-                self.pp_rank = storage_config.pp_rank
-                self.pp_size = storage_config.pp_size
-                self.attn_cp_rank = storage_config.attn_cp_rank
-                self.attn_cp_size = storage_config.attn_cp_size
-                self.layer_sharded = bool(
-                    getattr(storage_config, "layer_sharded", False)
+            if self._dfs_writer_slot is not None:
+                register = getattr(self.store, "register_dfs_writer", None)
+                if not callable(register):
+                    raise RuntimeError("DFS batch placement requires register_dfs_writer in the native binding")
+                registered = register(self._dfs_writer_slot)
+                if type(registered) is not int or registered != 0:
+                    raise RuntimeError(
+                        f"DFS writer slot {self._dfs_writer_slot} registration failed: {registered}"
+                    )
+                logger.info(
+                    "DFS writer registered: slot=%d prefill_index=%d cp_rank=%d cp_size=%d client_metrics_port=%s",
+                    self._dfs_writer_slot, self._dfs_writer_slot // 4,
+                    self.attn_cp_rank, self.attn_cp_size, self._dfs_client_metrics_port,
                 )
-                self.owned_layer_start = getattr(
-                    storage_config, "owned_layer_start", None
-                )
-                self.owned_layer_end = getattr(
-                    storage_config, "owned_layer_end", None
-                )
-                self.enable_storage_metrics = storage_config.enable_storage_metrics
+            if not self._dfs_batch_reader_only:
+                self.warmup()
+                logger.info("Mooncake store warmup successfully.")
             else:
-                self.is_mla_backend = False
-                self.local_rank = 0
-                self.pp_rank = 0
-                self.pp_size = 1
-                self.attn_cp_rank = 0
-                self.attn_cp_size = 1
-                self.layer_sharded = False
-                self.owned_layer_start = None
-                self.owned_layer_end = None
+                logger.info("DFS reader: no writer registration or write warmup")
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -978,6 +1152,128 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+    def _initialize_storage_identity(self, storage_config):
+        self.local_rank = getattr(storage_config, "tp_rank", 0)
+        self.is_mla_backend = getattr(storage_config, "is_mla_model", False)
+        self.pp_rank = getattr(storage_config, "pp_rank", 0)
+        self.pp_size = getattr(storage_config, "pp_size", 1)
+        self.attn_cp_rank = getattr(storage_config, "attn_cp_rank", 0)
+        self.attn_cp_size = getattr(storage_config, "attn_cp_size", 1)
+        self.layer_sharded = bool(getattr(storage_config, "layer_sharded", False))
+        self.owned_layer_start = getattr(storage_config, "owned_layer_start", None)
+        self.owned_layer_end = getattr(storage_config, "owned_layer_end", None)
+        self.enable_storage_metrics = getattr(storage_config, "enable_storage_metrics", False)
+
+    def _record_dfs_write_metric(self, event=None, *, pool=None, **values):
+        metrics = getattr(self, "_dfs_write_metrics", None)
+        if metrics is None:
+            return
+        if pool is None:
+            pool = getattr(getattr(self, "_dfs_metric_context", None), "pool", "kv")
+        metrics.record(pool, event, **values)
+
+    def record_backup_queued(self, operation, page_size, backup_skip=False, transfers=()):
+        if getattr(self, "_dfs_write_metrics", None) is None:
+            return
+        tickets = []
+        if not backup_skip and getattr(self.mem_pool_host, "kv_buffer", None) is not None:
+            tickets.append(("kv", len(operation.hash_value) * page_size, page_size))
+        for transfer in transfers:
+            pool = str(getattr(transfer.name, "value", transfer.name))
+            host_pool = self.registered_pools.get(transfer.name)
+            pool_page_size = getattr(host_pool, "page_size", 1) or 1
+            if transfer.keys is not None:
+                tokens = len(transfer.keys) * pool_page_size
+            elif transfer.indices_from_pool == PoolName.KV:
+                # KV-derived INDEXER keys/indices are resolved just before IO.
+                # Their logical page count already equals the primary chain.
+                tokens = len(operation.hash_value) * pool_page_size
+            elif transfer.host_indices is not None:
+                tokens = len(transfer.host_indices)
+            else:
+                # Do not invent a token count for an unresolved state pool.
+                tokens = 0
+            tickets.append((pool, tokens, pool_page_size))
+        operation._dfs_write_tickets = tickets
+        operation._dfs_write_queued_at = time.perf_counter()
+        for pool, tokens, _ in tickets:
+            self._record_dfs_write_metric(
+                "queued", pool=pool, operations=1, tokens=tokens,
+                pending=(("queued", 1, tokens),),
+            )
+
+    def record_backup_started(self, operation):
+        tickets = getattr(operation, "_dfs_write_tickets", ())
+        if not tickets:
+            return
+        now = time.perf_counter()
+        operation._dfs_write_started_at = now
+        for pool, tokens, _ in tickets:
+            self._record_dfs_write_metric(
+                "started", pool=pool, operations=1, tokens=tokens,
+                phase="queue", duration=now - operation._dfs_write_queued_at,
+                pending=(("queued", -1, -tokens), ("active", 1, tokens)),
+            )
+
+    def record_backup_finished(self, operation, *, ack_expected=True):
+        tickets = getattr(operation, "_dfs_write_tickets", ())
+        if not tickets or hasattr(operation, "_dfs_write_finished_at"):
+            return
+        now = time.perf_counter()
+        operation._dfs_write_finished_at = now
+        pending_state = "awaiting_ack" if ack_expected else "failed_no_ack"
+        operation._dfs_write_pending_state = pending_state
+        extra_hits = getattr(getattr(operation, "pool_storage_result", None), "extra_pool_hit_pages", {})
+        for pool, tokens, page_size in tickets:
+            if pool == "kv":
+                completed = operation.completed_tokens
+            else:
+                pages = extra_hits.get(pool, 0)
+                # 4ce7's hybrid backup stores the raw bool result vector in
+                # this map. Newer runtimes store a prefix-page count instead.
+                # Normalize only the observation; leave the original result
+                # and all ACK/storage semantics untouched.
+                if isinstance(pages, (list, tuple)):
+                    prefix_pages = 0
+                    for ok in pages:
+                        if not bool(ok):
+                            break
+                        prefix_pages += 1
+                    pages = prefix_pages
+                completed = pages * page_size if type(pages) is int else 0
+            completed = min(tokens, max(0, completed))
+            self._record_dfs_write_metric(
+                "local_completed", pool=pool, operations=int(completed == tokens and ack_expected),
+                tokens=completed, phase="operation",
+                duration=now - operation._dfs_write_started_at,
+                pending=(("active", -1, -tokens), (pending_state, 1, tokens)),
+            )
+            self._record_dfs_write_metric(
+                "local_failed", pool=pool, operations=int(completed < tokens or not ack_expected),
+                tokens=tokens - completed,
+            )
+
+    def record_backup_aborted(self, operation):
+        # The pinned 4ce7 backup daemon propagates exceptions without ACK.
+        # Observe this state without changing queue/host-buffer ownership.
+        self.record_backup_finished(operation, ack_expected=False)
+
+    def record_backup_ack_drained(self, operation):
+        tickets = getattr(operation, "_dfs_write_tickets", ())
+        if not tickets:
+            return
+        now = time.perf_counter()
+        for pool, tokens, _ in tickets:
+            self._record_dfs_write_metric(
+                "ack_drained", pool=pool, operations=1, tokens=tokens,
+                phase="ack_wait", duration=now - operation._dfs_write_finished_at,
+                pending=((getattr(operation, "_dfs_write_pending_state", "awaiting_ack"), -1, -tokens),),
+            )
+        operation._dfs_write_tickets = ()
+
+    def record_backup_ack_collective(self, duration):
+        self._record_dfs_write_metric(pool="all", phase="cp_ack_collective", duration=duration)
 
     @staticmethod
     def _iter_host_pool_buffers(host_pool: HostKVCache):
@@ -1395,7 +1691,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 if self._dfs_only:
                     io_results = self._write_batch_with_repair(
-                        key_strs, ptr_list, element_size_list, group_ids
+                        key_strs, ptr_list, element_size_list, group_ids,
+                        metrics_pool=transfer.name, logical_tokens=len(keys) * page_size,
                     )
                 else:
                     exist_result = self._batch_exist(key_strs)
@@ -1660,7 +1957,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         if self._dfs_only:
             results = self._write_batch_with_repair(
-                key_strs, buffer_ptrs, buffer_sizes, group_ids, track_metrics=True
+                key_strs, buffer_ptrs, buffer_sizes, group_ids, track_metrics=True,
+                logical_tokens=len(keys) * self.mem_pool_host.page_size,
             )
             return self._batch_postprocess(results, is_set_operate=True)
         exist_result = self._batch_exist(key_strs)
@@ -1981,7 +2279,45 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config.group_ids = group_ids
         return method(keys, pointers, sizes, config)
 
-    def _write_batch_with_repair(self, keys, pointers, sizes, group_ids=None, track_metrics=False):
+    def _write_batch_with_repair(self, keys, pointers, sizes, group_ids=None,
+                                 track_metrics=False, *, metrics_pool="kv", logical_tokens=0):
+        if getattr(self, "_dfs_batch_reader_only", False):
+            raise RuntimeError("A DFS batch-placement reader cannot submit writes")
+        metrics = getattr(self, "_dfs_write_metrics", None)
+        if metrics is None:
+            return self._write_batch_with_repair_impl(keys, pointers, sizes, group_ids, track_metrics)
+        context = self._dfs_metric_context
+        previous_pool = getattr(context, "pool", "kv")
+        context.pool = str(getattr(metrics_pool, "value", metrics_pool))
+        totals = [self._repair_object_size(size) or 0 for size in sizes]
+        started = time.perf_counter()
+        self._record_dfs_write_metric(
+            "batch_submitted", operations=1, objects=len(keys),
+            tokens=logical_tokens, payload_bytes=sum(totals),
+        )
+        results = None
+        try:
+            results = self._write_batch_with_repair_impl(keys, pointers, sizes, group_ids, track_metrics)
+            return results
+        finally:
+            valid = isinstance(results, (list, tuple)) and len(results) == len(keys)
+            succeeded = [i for i, result in enumerate(results if valid else ())
+                         if valid and type(result) is int and result == 0]
+            full_success = len(succeeded) == len(keys)
+            self._record_dfs_write_metric(
+                "batch_completed", operations=int(full_success),
+                objects=len(succeeded), payload_bytes=sum(totals[i] for i in succeeded if i < len(totals)),
+                tokens=logical_tokens if full_success else 0,
+                phase="batch", duration=time.perf_counter() - started,
+            )
+            self._record_dfs_write_metric(
+                "batch_failed", operations=int(not full_success),
+                objects=len(keys) - len(succeeded),
+                tokens=0 if full_success else logical_tokens,
+            )
+            context.pool = previous_pool
+
+    def _write_batch_with_repair_impl(self, keys, pointers, sizes, group_ids=None, track_metrics=False):
         """Synchronous backup of current owned L2 data; no repair from read data."""
         failed = [-1] * len(keys)
         if (
@@ -1994,11 +2330,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         totals = [self._repair_object_size(size) for size in sizes]
         if any(total is None for total in totals):
             return failed
+        existence_started = time.perf_counter()
         try:
             exists = self._batch_exist(keys)
         except Exception:
             logger.warning("DFS backup existence query raised; backup remains pending")
             return failed
+        finally:
+            self._record_dfs_write_metric(phase="existence", duration=time.perf_counter() - existence_started)
         if (
             not isinstance(exists, (list, tuple))
             or len(exists) != len(keys)
@@ -2068,15 +2407,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             selected_sizes = [sizes[index] for index in indices]
             selected_groups = self._filter_group_ids(group_ids, indices)
             started = time.perf_counter()
+            native_kind = "repair" if repair else "put"
+            self._record_dfs_write_metric(
+                f"{native_kind}_submitted", operations=1, objects=len(indices),
+                payload_bytes=sum(totals[index] for index in indices),
+            )
             try:
                 method = self._upsert_repair_batch if repair else self._put_batch_zero_copy_impl
                 values = method(selected_keys, selected_ptrs, selected_sizes, selected_groups)
             except Exception:
                 logger.warning("DFS backup native call raised; backup remains pending")
-                return [-1] * len(indices)
+                values = [-1] * len(indices)
             finally:
+                elapsed = time.perf_counter() - started
+                self._record_dfs_write_metric(phase=f"native_{native_kind}", duration=elapsed)
                 if track_metrics and self.enable_storage_metrics:
-                    elapsed = time.perf_counter() - started
                     self.backup_pgs.append(len(indices))
                     self.backup_bandwidth.append(len(indices) / elapsed * self.gb_per_page)
             if (
@@ -2084,7 +2429,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 or len(values) != len(indices)
                 or any(type(value) is not int for value in values)
             ):
-                return [-1] * len(indices)
+                values = [-1] * len(indices)
+            successful = [index for index, value in zip(indices, values) if value == 0]
+            self._record_dfs_write_metric(
+                f"{native_kind}_returned_success", operations=int(len(successful) == len(indices)),
+                objects=len(successful), payload_bytes=sum(totals[index] for index in successful),
+            )
+            self._record_dfs_write_metric(
+                f"{native_kind}_failed", operations=int(len(successful) < len(indices)),
+                objects=len(indices) - len(successful),
+            )
             return list(values)
 
         try:
@@ -2124,9 +2478,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for index, key, claim_id in repairs:
                 if state.finish(key, claim_id, repair_success):
                     result[index] = 0
+            duplicate_objects = 0
+            duplicate_bytes = 0
             for index in ready_existing:
                 if state.can_ack_existing(keys[index], failure_epoch):
                     result[index] = 0
+                    duplicate_objects += 1
+                    duplicate_bytes += totals[index]
+            self._record_dfs_write_metric("duplicate_ready", objects=duplicate_objects, payload_bytes=duplicate_bytes)
             return result
         finally:
             # Also release local claims if bookkeeping unexpectedly raises.
@@ -2135,6 +2494,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 state.finish(key, claim_id, False)
 
     def _resolve_existing_readiness(self, keys):
+        started = time.perf_counter()
+        try:
+            return self._resolve_existing_readiness_impl(keys)
+        finally:
+            self._record_dfs_write_metric(phase="readiness", duration=time.perf_counter() - started)
+
+    def _resolve_existing_readiness_impl(self, keys):
         """Wait for existing DFS keys to become readable COMPLETE objects.
 
         ``batch_is_exist`` reports readable COMPLETE replicas, not metadata
@@ -2161,10 +2527,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             replica_map = self._batch_readiness_probe(selected)
             if not isinstance(replica_map, dict):
                 replica_map = None
+            native_started = time.perf_counter()
             try:
                 exists = self._batch_exist(selected)
             except Exception:
                 exists = None
+            finally:
+                self._record_dfs_write_metric(phase="readiness_native_exist", duration=time.perf_counter() - native_started)
             if not isinstance(exists, (list, tuple)) or len(exists) != len(selected):
                 exists = [None] * len(selected)
             else:
@@ -2221,13 +2590,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            sleep_started = time.perf_counter()
             time.sleep(min(delay, remaining))
+            self._record_dfs_write_metric(phase="readiness_sleep", duration=time.perf_counter() - sleep_started)
             delay = next(
                 backoffs,
                 min(delay * 2, self._DFS_DUPLICATE_READY_BACKOFF_S[-1]),
             )
 
         if pending:
+            self._record_dfs_write_metric("readiness_timeout", operations=1, objects=len(pending))
             logger.warning(
                 "DFS duplicate readiness gate timed out; %d keys remain pending",
                 len(pending),
@@ -2247,10 +2619,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "DFS readiness probe falling back to ordinary BatchGetReplicaList; "
             "PROCESSING probes may be included in master failure counters"
         )
+        native_started = time.perf_counter()
         try:
             return query(keys)
         except Exception:
             return {}
+        finally:
+            self._record_dfs_write_metric(phase="readiness_native_desc", duration=time.perf_counter() - native_started)
 
     def _batch_admin_readiness_probe(self, keys):
         """Query the Mooncake admin endpoint when the selected build exposes it."""
@@ -2264,6 +2639,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # admin HTTP server uses the already pinned master_metrics_port.
         host = str(master).split(":", 1)[0]
         url = f"http://{host}:{int(port)}/batch_query_keys"
+        admin_started = time.perf_counter()
         try:
             response = requests.get(
                 url,
@@ -2275,6 +2651,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             payload = response.json()
         except Exception:
             return None
+        finally:
+            self._record_dfs_write_metric(phase="readiness_http", duration=time.perf_counter() - admin_started)
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
@@ -2314,6 +2692,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
+        metrics = getattr(self, "_dfs_write_metrics", None)
+        if metrics is not None:
+            storage_metrics.dfs_write = metrics.snapshot()
+            storage_metrics.dfs_writer_slot = getattr(self, "_dfs_writer_slot", None)
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)

@@ -1183,8 +1183,24 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
+        self._record_storage_backup_state(operation, "queued")
         self.backup_queue.put(operation)
         return operation.id
+
+    def _record_storage_backup_state(self, operation, state):
+        backend = getattr(self, "storage_backend", None)
+        record = getattr(backend, f"record_backup_{state}", None)
+        if record is None:
+            return
+        if state == "queued":
+            transfers = [
+                transfer
+                for transfer in getattr(operation, "pool_transfers", None) or []
+                if self.should_backup(transfer)
+            ]
+            record(operation, self.page_size, self.backup_skip, transfers)
+        else:
+            record(operation)
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
@@ -1302,8 +1318,16 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                self._record_storage_backup_state(operation, "started")
+                try:
+                    if not self.backup_skip:
+                        self._page_backup(operation)
+                except BaseException:
+                    # Preserve this pinned runtime's exception/no-ACK behavior.
+                    # Observe stranded work; do not release its host lease.
+                    self._record_storage_backup_state(operation, "aborted")
+                    raise
+                self._record_storage_backup_state(operation, "finished")
                 self.ack_backup_queue.put(operation)
 
             except Empty:

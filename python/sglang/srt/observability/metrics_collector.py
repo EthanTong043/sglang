@@ -1923,12 +1923,20 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_aborted_requests_total.labels(**labels).inc(1)
 
 
+STORAGE_WRITE_LATENCY_BUCKETS = (
+    0.00001, 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+    1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0,
+)
+
+
 @dataclass
 class StorageMetrics:
     prefetch_pgs: List[int] = field(default_factory=list)
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    dfs_write: Optional[dict] = None
+    dfs_writer_slot: Optional[int] = None
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -1937,12 +1945,55 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         labels: Dict[str, str],
     ):
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+
+        self.dfs_app_counters = {}
+        for unit in ("operations", "tokens", "objects", "payload_bytes"):
+            self.dfs_app_counters[unit] = Counter(
+                name=f"sglang:hicache_dfs_app_{unit}_total",
+                documentation=f"DFS application {unit} by pool and event. Queue/ACK counters "
+                "describe application completion, including existing readable objects. Batch "
+                "and native-call counters follow actual submission boundaries. Payload is "
+                "requested buffer size, NOT physical write, fsync or published-new bytes. "
+                "Native put_returned_success can include a duplicate no-op; only Mooncake "
+                "native I/O/publication counters establish newly written bytes.",
+                labelnames=list(labels.keys()) + ["pool", "event"],
+            )
+        self.dfs_app_pending = {}
+        for unit in ("operations", "tokens"):
+            self.dfs_app_pending[unit] = Gauge(
+                name=f"sglang:hicache_dfs_app_pending_{unit}",
+                documentation=f"DFS application {unit} in queued, active, awaiting_ack or failed_no_ack state. "
+                "Awaiting ACK includes CP/TP consensus and scheduler delay. failed_no_ack is "
+                "an exception that the pinned runtime propagates without releasing its host lease.",
+                labelnames=list(labels.keys()) + ["pool", "state"],
+                multiprocess_mode="livemostrecent",
+            )
+            for pool in ("kv", "indexer"):
+                for state in ("queued", "active", "awaiting_ack", "failed_no_ack"):
+                    self.dfs_app_pending[unit].labels(**labels, pool=pool, state=state).set(0)
+        self.dfs_app_phase_seconds = Histogram(
+            name="sglang:hicache_dfs_app_phase_seconds",
+            documentation="DFS application phase wall time. Readiness total includes HTTP, "
+            "native probes and backoff, so these phases must not be added together. "
+            "cp_ack_collective covers the existing scheduler acknowledgement-count "
+            "collective (CP/TP and PP when present), not an extra synchronization.",
+            labelnames=list(labels.keys()) + ["pool", "phase"],
+            buckets=STORAGE_WRITE_LATENCY_BUCKETS,
+        )
+        self.dfs_writer_slot = Gauge(
+            name="sglang:hicache_dfs_writer_slot",
+            documentation="Explicit lifecycle DFS writer slot bound to this CP rank; absent for readers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="livemostrecent",
+        )
 
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
@@ -1952,7 +2003,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
-            documentation="Number of backuped tokens.",
+            documentation="Application host-to-storage tokens at scheduler ACK drain, "
+            "including accepted existing objects. Not newly written or GPFS physical bytes.",
             labelnames=labels.keys(),
         )
 
@@ -2018,6 +2070,22 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             return
 
         assert isinstance(storage_metrics, StorageMetrics)
+
+        if storage_metrics.dfs_writer_slot is not None:
+            self.dfs_writer_slot.labels(**self.labels).set(storage_metrics.dfs_writer_slot)
+        if storage_metrics.dfs_write is not None:
+            snapshot = storage_metrics.dfs_write
+            for (pool, event, unit), value in snapshot["counters"].items():
+                self.dfs_app_counters[unit].labels(**self.labels, pool=pool, event=event).inc(value)
+            for (pool, state, unit), value in snapshot["pending"].items():
+                self.dfs_app_pending[unit].labels(**self.labels, pool=pool, state=state).set(value)
+            for (pool, phase), (_, elapsed, buckets) in snapshot["timings"].items():
+                histogram = self.dfs_app_phase_seconds.labels(**self.labels, pool=pool, phase=phase)
+                # Same aggregate observation method used by inter-token
+                # latency above; samples are bounded histograms, not lists.
+                histogram._sum.inc(elapsed)
+                for bucket, count in zip(histogram._buckets, buckets):
+                    bucket.inc(count)
 
         for v in storage_metrics.prefetch_pgs:
             self._log_histogram(self.histogram_prefetch_pgs, v)

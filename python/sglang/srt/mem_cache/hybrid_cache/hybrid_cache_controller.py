@@ -610,6 +610,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        self._record_storage_backup_state(operation, "queued")
         self.backup_queue.put(operation)
         return operation.id
 
@@ -864,7 +865,15 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                self._record_storage_backup_state(operation, "started")
+                try:
+                    self._page_backup(operation)
+                except BaseException:
+                    # Match the pinned runtime: exceptions still propagate
+                    # without an ACK or host-slot release.
+                    self._record_storage_backup_state(operation, "aborted")
+                    raise
+                self._record_storage_backup_state(operation, "finished")
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
