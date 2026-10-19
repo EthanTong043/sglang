@@ -16,6 +16,8 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -309,6 +311,9 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        self.backup_io_workers = 1
+        self.backup_primary_bytes_limit = 0
+        self._backup_executor = None
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -410,8 +415,63 @@ class HiCacheController:
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
+        self._start_backup_executor()
         self.prefetch_thread.start()
         self.backup_thread.start()
+
+    def _configure_backup_executor(self):
+        extra = self.storage_config.extra_config or {}
+        workers = extra.get("backup_io_workers", 1)
+        if type(workers) is not int or workers not in (1, 2, 4):
+            raise ValueError("backup_io_workers must be one of the integers 1, 2, 4")
+        self.backup_io_workers = workers
+        self.backup_primary_bytes_limit = 0
+        if workers == 1:
+            return
+        if (
+            self.storage_backend_type != "mooncake"
+            or not getattr(self.storage_backend, "_dfs_only", False)
+            or self.io_backend != "direct"
+            or self.mem_pool_host.layout != "page_first_direct"
+            or self.page_set_func != self._page_set_zero_copy
+        ):
+            raise ValueError(
+                "backup_io_workers > 1 requires Mooncake DFS-only, direct IO, "
+                "page_first_direct, and the native v1 primary write path"
+            )
+        bytes_per_token = self.mem_pool_host.size_per_token
+        if type(bytes_per_token) is not int or bytes_per_token <= 0:
+            raise ValueError(
+                "bounded backup requires a positive primary size_per_token"
+            )
+        # Workers only borrow the already-protected host indices. At most B
+        # native primary batches exist, each with at most 128 pages. Hybrid
+        # sidecars finish synchronously before entering this primary executor.
+        self.backup_primary_bytes_limit = (
+            workers * STORAGE_BATCH_SIZE * self.page_size * bytes_per_token
+        )
+        logger.info(
+            "Bounded DFS primary backup: workers=%d, max submitted payload=%d bytes",
+            workers,
+            self.backup_primary_bytes_limit,
+        )
+
+    def _start_backup_executor(self):
+        if getattr(self, "backup_io_workers", 1) == 1:
+            return
+        if getattr(self, "_backup_executor", None) is not None:
+            raise RuntimeError("Previous backup executor has not stopped")
+        self._backup_executor = ThreadPoolExecutor(
+            max_workers=self.backup_io_workers, thread_name_prefix="hicache-backup"
+        )
+
+    def _shutdown_backup_executor(self):
+        executor = getattr(self, "_backup_executor", None)
+        if executor is not None:
+            # Called only after the coordinator stops. It drains every submitted
+            # task before returning, including unsuccessful and interrupted ops.
+            executor.shutdown(wait=True)
+            self._backup_executor = None
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -458,6 +518,7 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        self._shutdown_backup_executor()
 
     def attach_storage_backend(
         self,
@@ -536,6 +597,7 @@ class HiCacheController:
                 self.page_set_func = self._page_set_zero_copy
 
             self._maybe_register_draft_with_storage()
+            self._configure_backup_executor()
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -708,6 +770,7 @@ class HiCacheController:
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
+            self._shutdown_backup_executor()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
@@ -718,6 +781,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
+            self._start_backup_executor()
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
@@ -1283,6 +1347,8 @@ class HiCacheController:
 
     # Backup batch by batch
     def _page_backup(self, operation):
+        if getattr(self, "backup_io_workers", 1) > 1:
+            return self._page_backup_bounded(operation)
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1307,6 +1373,186 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+
+    def _backup_primary_batch(
+        self, operation_id, start, hashes, indices, extra_info, failed,
+        stats, stats_lock, submitted_at,
+    ):
+        started = time.perf_counter()
+        with stats_lock:
+            stats["worker_queue_seconds"] += started - submitted_at
+            stats["active_batches"] += 1
+            active = stats["active_batches"]
+            stats["peak_active_batches"] = max(
+                stats["peak_active_batches"], active
+            )
+        try:
+            trace_event(
+                "backup_batch_begin", operation_id=operation_id,
+                batch_index=start // STORAGE_BATCH_SIZE, batch_pages=len(hashes),
+                queue_depth=active, phase="executor_queue",
+                elapsed_s=started - submitted_at,
+            )
+            results = self.storage_backend.batch_set_v1(hashes, indices, extra_info)
+            # Do not let all([]), truncated, or malformed native result vectors
+            # acknowledge unwritten pages. Keep the per-page result for audit.
+            valid = (
+                isinstance(results, (list, tuple))
+                and len(results) == len(hashes)
+                and all(type(result) is bool for result in results)
+            )
+            page_results = tuple(results) if valid else None
+            if page_results is None or not all(page_results):
+                failed.set()
+            return page_results
+        except BaseException:
+            failed.set()
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            with stats_lock:
+                stats["active_batches"] -= 1
+                stats["execution_seconds"] += elapsed
+            trace_event(
+                "backup_batch_end", operation_id=operation_id,
+                batch_index=start // STORAGE_BATCH_SIZE,
+                batch_pages=len(hashes), elapsed_s=elapsed,
+            )
+
+    def _page_backup_bounded(self, operation):
+        """Overlap primary sub-batches; retain operation/ACK/host ownership.
+
+        Only this coordinator advances the contiguous prefix or writes legacy
+        draft pages. Every submitted future is consumed before return/raise, so
+        the existing operation ACK can never outlive native host-buffer access.
+        """
+        executor = self._backup_executor
+        if executor is None:
+            raise RuntimeError("Bounded backup executor is not running")
+        failed = threading.Event()
+        stats_lock = threading.Lock()
+        stats = operation.backup_io_stats = {
+            "workers": self.backup_io_workers,
+            "primary_bytes_limit": self.backup_primary_bytes_limit,
+            "submitted_batches": 0,
+            "peak_pending_batches": 0,
+            "active_batches": 0,
+            "peak_active_batches": 0,
+            "execution_seconds": 0.0,
+            "worker_queue_seconds": 0.0,
+            "coordinator_wait_seconds": 0.0,
+            "successful_pages": 0,
+            "unconfirmed_successful_pages": 0,
+        }
+        operation.backup_batch_results = []
+        pending = deque()
+        next_page = 0
+        contiguous = True
+        first_error = None
+        initial_completed_tokens = operation.completed_tokens
+
+        def record_result(start, hashes, results, error):
+            operation.backup_batch_results.append(
+                {
+                    "start_page": start,
+                    "pages": len(hashes),
+                    "results": results,
+                    "error": error,
+                }
+            )
+            stats["successful_pages"] += sum(results or ())
+
+        def submit_available():
+            nonlocal next_page
+            while (
+                len(pending) < self.backup_io_workers
+                and next_page < len(operation.hash_value)
+                and not failed.is_set()
+                and not self.storage_stop_event.is_set()
+            ):
+                start = next_page
+                hashes = operation.hash_value[start : start + STORAGE_BATCH_SIZE]
+                indices = operation.host_indices[
+                    start * self.page_size : (start + len(hashes)) * self.page_size
+                ]
+                # Each worker owns its prefix list. Do not race on the list
+                # mutated by the legacy serial path or share it between tasks.
+                prefix = operation.prefix_keys
+                prefix = None if prefix is None else list(prefix)
+                if prefix:
+                    prefix += operation.hash_value[:start]
+                future = executor.submit(
+                    self._backup_primary_batch, operation.id, start, hashes, indices,
+                    HiCacheStorageExtraInfo(prefix_keys=prefix), failed, stats, stats_lock,
+                    time.perf_counter(),
+                )
+                pending.append((start, hashes, indices, future))
+                next_page += len(hashes)
+                stats["submitted_batches"] += 1
+                stats["peak_pending_batches"] = max(
+                    stats["peak_pending_batches"], len(pending)
+                )
+
+        try:
+            submit_available()
+            while pending:
+                start, hashes, indices, future = pending[0]
+                waiting = time.perf_counter()
+                results = None
+                error = None
+                try:
+                    results = future.result()
+                except BaseException as exc:
+                    failed.set()
+                    # An interruption of this coordinator is not evidence that
+                    # the worker has finished. Leave it pending for final drain.
+                    if not future.done():
+                        raise
+                    first_error = first_error or exc
+                    error = type(exc).__name__
+                finally:
+                    stats["coordinator_wait_seconds"] += time.perf_counter() - waiting
+                pending.popleft()
+                success = results is not None and all(results)
+                record_result(start, hashes, results, error)
+                if contiguous and success:
+                    # A consumed primary future no longer occupies a worker.
+                    # Legacy draft remains on the coordinator and retains its
+                    # best-effort error policy and prefix order.
+                    if self.has_draft:
+                        self._draft_page_set(hashes, indices)
+                    operation.completed_tokens += self.page_size * len(hashes)
+                else:
+                    contiguous = False
+                    failed.set()
+                submit_available()
+        finally:
+            # Submission errors or a coordinator exception (e.g. draft) must
+            # also drain the whole bounded window before the no-ACK error path.
+            for start, hashes, _, future in pending:
+                try:
+                    results = future.result()
+                    record_result(start, hashes, results, None)
+                except BaseException as exc:
+                    record_result(start, hashes, None, type(exc).__name__)
+            stats["unconfirmed_successful_pages"] = stats["successful_pages"] - (
+                operation.completed_tokens - initial_completed_tokens
+            ) // self.page_size
+            trace_event(
+                "backup_operation_io_end", operation_id=operation.id,
+                completed_tokens=operation.completed_tokens,
+                queue_depth=stats["peak_active_batches"],
+                page_count=stats["successful_pages"],
+                byte_count=stats["primary_bytes_limit"],
+                phase="coordinator_wait", elapsed_s=stats["coordinator_wait_seconds"],
+            )
+            trace_event(
+                "backup_operation_pending_peak", operation_id=operation.id,
+                queue_depth=stats["peak_pending_batches"],
+                page_count=stats["unconfirmed_successful_pages"],
+            )
+        if first_error is not None:
+            raise first_error
 
     def backup_thread_func(self):
         """
