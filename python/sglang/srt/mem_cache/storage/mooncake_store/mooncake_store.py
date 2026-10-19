@@ -30,7 +30,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
 )
 
-DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MiB per client/rank
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
@@ -277,6 +277,28 @@ class MooncakeStoreConfig:
     # Mooncake 目前只支持 0 或 1（master_service.cpp 对 >1 返回
     # INVALID_PARAMS）；DFS-only 需要显式 dfs_only=true。
     dfs_replica_num: int = 0
+    # Native client staging used by DFS reads, separate from the host KV pool
+    # and MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES in the offload backend.
+    client_local_buffer_size_bytes: int = DEFAULT_LOCAL_BUFFER_SIZE
+
+    def __post_init__(self):
+        self.client_local_buffer_size_bytes = self.validate_client_local_buffer_size(
+            self.client_local_buffer_size_bytes
+        )
+
+    @staticmethod
+    def validate_client_local_buffer_size(value) -> int:
+        # bool is an int subclass; do not admit it or silently coerce floats.
+        if (
+            type(value) is not int
+            or not 4096 <= value <= 1024 * 1024 * 1024
+            or value % 4096 != 0
+        ):
+            raise ValueError(
+                "client_local_buffer_size_bytes must be an integer multiple "
+                "of 4096 in [4096, 1073741824]"
+            )
+        return value
 
     def effective_replica_num(self) -> int:
         """Return the explicit MEMORY replica count for writes.
@@ -367,6 +389,9 @@ class MooncakeStoreConfig:
             dfs_replica_num=int(
                 config.get("dfs_replica_num", envs.MOONCAKE_DFS_REPLICA_NUM.default)
             ),
+            client_local_buffer_size_bytes=config.get(
+                "client_local_buffer_size_bytes", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
         )
 
     @staticmethod
@@ -393,6 +418,19 @@ class MooncakeStoreConfig:
                 "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
             )
 
+        # Parse this opt-in directly rather than EnvInt.get(), whose malformed
+        # input fallback would silently turn an intended experiment into 16 MiB.
+        buffer_size = os.getenv("MOONCAKE_CLIENT_LOCAL_BUFFER_SIZE_BYTES")
+        if buffer_size is None:
+            buffer_size = DEFAULT_LOCAL_BUFFER_SIZE
+        elif not buffer_size.isascii() or not buffer_size.isdecimal():
+            raise ValueError(
+                "MOONCAKE_CLIENT_LOCAL_BUFFER_SIZE_BYTES must contain "
+                "decimal integer bytes"
+            )
+        else:
+            buffer_size = int(buffer_size)
+
         return MooncakeStoreConfig(
             local_hostname=local_hostname,
             metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.get(),
@@ -412,6 +450,7 @@ class MooncakeStoreConfig:
             replica_num=envs.MOONCAKE_REPLICA_NUM.get(),
             dfs_only=envs.MOONCAKE_DFS_ONLY.get(),
             dfs_replica_num=envs.MOONCAKE_DFS_REPLICA_NUM.get(),
+            client_local_buffer_size_bytes=buffer_size,
         )
 
     @staticmethod
@@ -476,6 +515,9 @@ class MooncakeStoreConfig:
                 extra_config.get(
                     "dfs_replica_num", envs.MOONCAKE_DFS_REPLICA_NUM.default
                 )
+            ),
+            client_local_buffer_size_bytes=extra_config.get(
+                "client_local_buffer_size_bytes", DEFAULT_LOCAL_BUFFER_SIZE
             ),
         )
 
@@ -579,6 +621,15 @@ class MooncakeBaseStore:
         else:
             config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded from env successfully.")
+
+        # A size-only extra config must still take effect when connection
+        # details come from the existing file/environment fallback path.
+        if extra_config and "client_local_buffer_size_bytes" in extra_config:
+            config.client_local_buffer_size_bytes = (
+                MooncakeStoreConfig.validate_client_local_buffer_size(
+                    extra_config["client_local_buffer_size_bytes"]
+                )
+            )
 
         return config
 
@@ -993,7 +1044,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.client_local_buffer_size_bytes,
                     self.config.client_server_address,
                 )
             else:
@@ -1046,7 +1097,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.config.client_local_buffer_size_bytes,
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
@@ -1092,7 +1143,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
-            logger.info("Mooncake store setup successfully.")
+            logger.info(
+                "Mooncake store setup successfully: client_local_buffer_size_bytes=%d "
+                "standalone_storage=%s",
+                self.config.client_local_buffer_size_bytes,
+                self.config.standalone_storage,
+            )
 
             if self._dfs_writer_slot is not None:
                 register = getattr(self.store, "register_dfs_writer", None)
