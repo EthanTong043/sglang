@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 import os
+import queue
 import runpy
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,7 +44,7 @@ class _Transfer(NamedTuple):
     is_draft: bool = False
 
 
-def _load_method(source: str):
+def _load_method(source: str, trace=None):
     """Compile only the production method; never import its runtime module."""
     tree = ast.parse(source, filename=str(CONTROLLER))
     classes = [
@@ -63,7 +65,7 @@ def _load_method(source: str):
     code = ast.fix_missing_locations(
         ast.Module(body=future + methods, type_ignores=[])
     )
-    scope = {"L2Transfer": _Transfer}
+    scope = {"L2Transfer": _Transfer, "trace_event": trace or (lambda *args, **kwargs: None)}
     exec(compile(code, str(CONTROLLER), "exec"), scope)
     return scope["_l2_load_transfers"]
 
@@ -247,6 +249,51 @@ class TestMtpLocalHostRestore(unittest.TestCase):
         fixture = _fixture(draft_count=2, host_layer_num=21, cp_rank=3)
         with self.assertRaises(ValueError):
             self.restore(fixture)
+
+
+class TestMtpDescriptorTrace(unittest.TestCase):
+    def setUp(self):
+        # Real emitter with an in-memory bounded queue: no writer thread or file.
+        helper = runpy.run_path(str(
+            REPO / "python/sglang/srt/mem_cache/prefetch_trace_runtime.py"
+        ))
+        cls = helper["_PrefetchTrace"]
+        self.trace = cls.__new__(cls)
+        self.trace._queue = queue.Queue(maxsize=2)
+        self.trace._lock = threading.Lock()
+        self.trace._closed = False
+        self.trace._accepted = self.trace._dropped = 0
+        self.trace.max_events = 4
+
+    def test_real_controller_trace_preserves_local_slot_evidence(self):
+        fixture = _fixture(cp_rank=2)
+        load = _load_method(CONTROLLER.read_text(), self.trace.emit)
+        load(fixture.controller, object(), object(), None)
+        records = [self.trace._queue.get_nowait() for _ in range(2)]
+        for record in records:
+            self.assertEqual(record["event"], "mtp_load_descriptor")
+            self.assertEqual(
+                [record[key] for key in (
+                    "draft_depth", "virtual_layer", "host_layer", "host_layer_count"
+                )], [0, 78, 20, 21]
+            )
+        self.assertTrue(self.trace._queue.empty())
+
+    def test_emitter_keeps_queue_and_event_limits(self):
+        for _ in range(5):
+            self.trace.emit("mtp_load_descriptor", host_layer=20)
+        self.assertEqual(self.trace._queue.qsize(), 2)
+        self.assertEqual(self.trace._accepted, 4)
+        self.assertEqual(self.trace._dropped, 3)
+
+    def test_emitter_still_filters_unknown_and_unsafe_values(self):
+        self.trace.emit("mtp_load_descriptor", host_layer=1 << 80,
+                        host_layer_count=21, draft_depth=float("nan"),
+                        virtual_layer=object(), private_payload="secret")
+        record = self.trace._queue.get_nowait()
+        self.assertEqual(record["host_layer_count"], 21)
+        for key in ("host_layer", "draft_depth", "virtual_layer", "private_payload"):
+            self.assertNotIn(key, record)
 
 
 if __name__ == "__main__":

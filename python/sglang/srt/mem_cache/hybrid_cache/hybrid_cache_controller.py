@@ -475,6 +475,25 @@ class HybridCacheController(BaseHiCacheController):
                     draft_host_layer = transfer.layer_mapper(self.layer_num + depth)
                     if draft_host_layer is None:
                         continue
+                    # Device/global virtual layers do not index the packed CP
+                    # host layout. Drafts follow its padded local target slots.
+                    host_pool = transfer.host_pool
+                    target_layer_num = getattr(host_pool, "target_layer_num", None)
+                    if target_layer_num is not None:
+                        draft_host_layer = target_layer_num + depth
+                        if not 0 <= draft_host_layer < host_pool.layer_num:
+                            raise ValueError(
+                                "Packed MTP host layer is out of bounds: "
+                                f"layer={draft_host_layer}, layers={host_pool.layer_num}"
+                            )
+                    trace_event(
+                        "mtp_load_descriptor",
+                        pool=type(host_pool).__name__,
+                        draft_depth=depth,
+                        virtual_layer=self.layer_num + depth,
+                        host_layer=draft_host_layer,
+                        host_layer_count=getattr(host_pool, "layer_num", None),
+                    )
 
                     def draft_layer_mapper(
                         layer_id: int,
