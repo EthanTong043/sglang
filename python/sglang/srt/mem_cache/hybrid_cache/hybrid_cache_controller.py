@@ -141,6 +141,18 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(grouped, bool):
             raise ValueError("prefetch_complete_groups must be bool")
         self.prefetch_complete_groups = grouped
+        # Complete-group restore pipeline depth: how many page groups may be in
+        # flight at once (KV and sidecars of a group are read concurrently).
+        # 1 keeps the original serial read order. Each in-flight group holds
+        # its KV+sidecar bytes in Mooncake staging, so depth must fit the
+        # configured local_buffer_size.
+        depth = (storage_backend_extra_config or {}).get(
+            "prefetch_pipeline_depth", 1
+        )
+        if not isinstance(depth, int) or isinstance(depth, bool) or not 1 <= depth <= 8:
+            raise ValueError("prefetch_pipeline_depth must be an int in [1, 8]")
+        self.prefetch_pipeline_depth = depth
+        self._restore_pool = None
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -689,6 +701,8 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_transfer(self, operation):
         if self._can_read_complete_groups(operation):
+            if self.prefetch_pipeline_depth > 1:
+                return self._page_transfer_complete_groups_pipelined(operation)
             return self._page_transfer_complete_groups(operation)
 
         # KV pools first — determines actual completed page count
@@ -811,6 +825,139 @@ class HybridCacheController(BaseHiCacheController):
             operation.mark_terminate()
             logger.error("Complete-group prefetch failed: %s", type(exc).__name__)
         finally:
+            operation.pool_transfers_done = True
+
+    def _restore_executor(self):
+        # Two calls (KV and sidecars) per in-flight group; the caller thread
+        # only submits and publishes, so workers never wait on each other.
+        if self._restore_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._restore_pool = ThreadPoolExecutor(
+                max_workers=2 * self.prefetch_pipeline_depth,
+                thread_name_prefix="hicache-restore",
+            )
+        return self._restore_pool
+
+    def _page_transfer_complete_groups_pipelined(self, operation):
+        """Complete-group restore with up to ``prefetch_pipeline_depth`` groups
+        in flight; KV and sidecars of each group are read concurrently.
+
+        Mooncake calls release the GIL, so reads of different groups and pools
+        overlap in the native read pool. Publication is unchanged: groups are
+        published strictly in order, each only up to the common successful
+        prefix of all its pools, and the first short group terminates the
+        operation. Sidecars are read for the whole group alongside KV, so a
+        short KV read may leave sidecar bytes in the uncommitted tail; those
+        slots stay owned by this operation until every in-flight read has
+        finished, and the auxiliary worker releases them after we return.
+        """
+        from collections import deque
+
+        prefix_keys = operation.prefix_keys
+        # The serial path passes the live list, grown after each published
+        # group; give each group the same snapshot it would have seen.
+        base_prefix = list(prefix_keys) if prefix_keys else None
+        pool = self._restore_executor()
+        inflight = deque()
+
+        def read_kv(hashes, indices, group_prefix):
+            if self.has_draft:
+                self._draft_page_get(hashes, indices)
+            trace_event("kv_batch_begin", operation_id=operation.id,
+                        request_id=operation.request_id, batch_pages=len(hashes))
+            results = self.storage_backend.batch_get_v1(
+                hashes, indices, HiCacheStorageExtraInfo(prefix_keys=group_prefix)
+            )
+            trace_event("kv_batch_end", operation_id=operation.id,
+                        request_id=operation.request_id, batch_pages=len(hashes))
+            return results
+
+        def read_sidecars(transfers, pages):
+            trace_event("sidecar_batch_begin", operation_id=operation.id,
+                        request_id=operation.request_id, batch_pages=pages)
+            results = self.storage_backend.batch_get_v2(transfers)
+            trace_event("sidecar_batch_end", operation_id=operation.id,
+                        request_id=operation.request_id, batch_pages=pages)
+            return results
+
+        def submit(start):
+            hashes = operation.hash_value[start : start + STORAGE_BATCH_SIZE]
+            indices = operation.host_indices[
+                start * self.page_size : (start + len(hashes)) * self.page_size
+            ]
+            group_prefix = (
+                base_prefix + list(operation.hash_value[:start])
+                if base_prefix is not None
+                else prefix_keys
+            )
+            transfers = [
+                replace(transfer, host_indices=indices, keys=hashes)
+                for transfer in operation.pool_transfers
+            ]
+            inflight.append(
+                (
+                    hashes,
+                    transfers,
+                    pool.submit(read_kv, hashes, indices, group_prefix),
+                    pool.submit(read_sidecars, transfers, len(hashes)),
+                )
+            )
+
+        try:
+            if operation.is_terminated():
+                return
+            for transfer in operation.pool_transfers:
+                if transfer.keys is not None and transfer.keys != operation.hash_value:
+                    raise ValueError("KV-derived sidecar keys differ from allocated KV prefix")
+            self._resolve_sidecar_derived_pool_transfers(operation)
+            starts = deque(range(0, len(operation.hash_value), STORAGE_BATCH_SIZE))
+            while starts or inflight:
+                while (
+                    starts
+                    and len(inflight) < self.prefetch_pipeline_depth
+                    and not operation.is_terminated()
+                ):
+                    submit(starts.popleft())
+                if not inflight:
+                    break
+                hashes, transfers, kv_future, sidecar_future = inflight.popleft()
+                kv_results = kv_future.result()
+                sidecar_results = sidecar_future.result()
+                if operation.is_terminated():
+                    break
+                common_pages = self._successful_prefix(kv_results, len(hashes))
+                for transfer in transfers:
+                    common_pages = min(
+                        common_pages,
+                        self._successful_prefix(
+                            sidecar_results.get(transfer.name), len(hashes)
+                        ),
+                    )
+                if common_pages == 0:
+                    operation.mark_terminate()
+                    break
+                if not operation.publish_complete_group(
+                    common_pages * self.page_size, self.page_size
+                ):
+                    break
+                if common_pages != len(hashes):
+                    operation.mark_terminate()
+                    break
+                if prefix_keys:
+                    prefix_keys += hashes
+        except Exception as exc:
+            operation.mark_terminate()
+            logger.error("Pipelined complete-group prefetch failed: %s", type(exc).__name__)
+        finally:
+            # Reads still in flight write into this operation's host slots;
+            # they must finish before the caller releases the uncommitted tail.
+            for _, _, kv_future, sidecar_future in inflight:
+                for future in (kv_future, sidecar_future):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
             operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
