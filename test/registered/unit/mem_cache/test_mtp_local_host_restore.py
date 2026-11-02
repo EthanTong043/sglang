@@ -296,5 +296,62 @@ class TestMtpDescriptorTrace(unittest.TestCase):
             self.assertNotIn(key, record)
 
 
+class TestTraceRequestJoin(unittest.TestCase):
+    """rid_hash joins one request across CP ranks only with a shared key."""
+
+    def _trace(self, key, path):
+        cls = runpy.run_path(str(
+            REPO / "python/sglang/srt/mem_cache/prefetch_trace_runtime.py"
+        ))["_PrefetchTrace"]
+        saved = {k: os.environ.get(k) for k in (
+            "SGLANG_PREFETCH_TRACE_RID_KEY", "SGLANG_PREFETCH_TRACE_PATH")}
+        try:
+            os.environ.pop("SGLANG_PREFETCH_TRACE_RID_KEY", None)
+            if key is not None:
+                os.environ["SGLANG_PREFETCH_TRACE_RID_KEY"] = key
+            os.environ["SGLANG_PREFETCH_TRACE_PATH"] = path
+            trace = cls()  # production __init__, including its writer thread
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(trace.close)
+        return trace
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def test_shared_key_gives_equal_hash_across_ranks(self):
+        a = self._trace("run-1", self.path("a"))
+        b = self._trace("run-1", self.path("b"))
+        c = self._trace("run-2", self.path("c"))
+        self.assertEqual(a._rid_hash("req-7"), b._rid_hash("req-7"))
+        self.assertNotEqual(a._rid_hash("req-7"), c._rid_hash("req-7"))
+
+    def test_without_key_hashes_differ_per_process(self):
+        a = self._trace(None, self.path("a"))
+        b = self._trace(None, self.path("b"))
+        self.assertNotEqual(a._rid_hash("req-7"), b._rid_hash("req-7"))
+
+    def test_records_report_events_dropped_before_them(self):
+        t = self._trace("k", self.path("t"))
+        t.max_events = 2
+        for op in (1, 2, 3):  # the third is over the limit and dropped
+            t.emit("prefetch_aux_start", operation_id=op)
+        t.close()
+        with open(self.path("t")) as f:
+            records = [__import__("json").loads(line) for line in f]
+        self.assertEqual([r["operation_id"] for r in records], [1, 2])
+        self.assertEqual([r["dropped_before"] for r in records], [0, 0])
+        self.assertEqual(t.close(), {"accepted": 2, "dropped": 1})
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

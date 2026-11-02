@@ -71,7 +71,15 @@ class _PrefetchTrace:
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
             maxsize=self.queue_capacity
         )
-        self._secret = secrets.token_bytes(16)
+        # A shared key (same value on every rank of a run) makes rid_hash equal
+        # across CP ranks and processes, so one request can be joined across
+        # traces. Without it each process hashes with its own random key.
+        shared = os.environ.get("SGLANG_PREFETCH_TRACE_RID_KEY", "")
+        self._secret = (
+            hashlib.blake2b(shared.encode("utf-8"), digest_size=16).digest()
+            if shared
+            else secrets.token_bytes(16)
+        )
         self._accepted = 0
         self._dropped = 0
         self._lock = threading.Lock()
@@ -96,12 +104,16 @@ class _PrefetchTrace:
                 self._dropped += 1
                 return
             self._accepted += 1
+            # Records the number of events lost so far, so an analysis can
+            # tell a complete trace from a truncated one.
+            dropped = self._dropped
         record: dict[str, Any] = {
             "schema": "sglang-prefetch-trace-v1",
             "event": str(event)[:_MAX_STRING],
             "monotonic_ns": time.monotonic_ns(),
             "pid": os.getpid(),
             "thread_id": threading.get_ident(),
+            "dropped_before": dropped,
         }
         request_id = fields.pop("request_id", None)
         if request_id is not None:
