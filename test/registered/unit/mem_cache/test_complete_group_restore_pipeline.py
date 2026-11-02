@@ -88,8 +88,12 @@ class _Op:
 class _Storage:
     """Records concurrency; ``short`` maps group start page -> hits."""
 
-    def __init__(self, delay=0.05, short_kv=None, short_sidecar=None, raise_at=None):
+    def __init__(self, delay=0.05, short_kv=None, short_sidecar=None, raise_at=None,
+                 sidecar_delay_at=None, on_kv=None):
         self.delay = delay
+        self.sidecar_delay_at = sidecar_delay_at or {}
+        self.on_kv = on_kv
+        self.finished = []
         self.short_kv = short_kv or {}
         self.short_sidecar = short_sidecar or {}
         self.raise_at = raise_at
@@ -99,18 +103,21 @@ class _Storage:
         self.calls = []
         self.prefixes = {}
 
-    def _enter(self, kind, first):
+    def _enter(self, kind, first, delay=None):
         with self.lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
             self.calls.append((kind, first))
-        time.sleep(self.delay)
+        time.sleep(self.delay if delay is None else delay)
         with self.lock:
             self.active -= 1
+            self.finished.append((kind, first))
 
     def batch_get_v1(self, hashes, indices, extra_info):
         first = int(hashes[0][1:])
         self.prefixes[first] = extra_info.prefix_keys
+        if self.on_kv:
+            self.on_kv(first)
         if self.raise_at == first:
             raise RuntimeError("io")
         self._enter("kv", first)
@@ -119,7 +126,7 @@ class _Storage:
 
     def batch_get_v2(self, transfers):
         first = int(transfers[0].keys[0][1:])
-        self._enter("sidecar", first)
+        self._enter("sidecar", first, self.sidecar_delay_at.get(first))
         hits = self.short_sidecar.get(first, len(transfers[0].keys))
         return {t.name: [i < hits for i in range(len(t.keys))] for t in transfers}
 
@@ -221,6 +228,80 @@ class PipelinedRestoreTest(unittest.TestCase):
             _Op(6, prefix_keys=["p"])
         )
         self.assertEqual(piped_store.prefixes, serial_store.prefixes)
+
+
+class _FlakyPool:
+    """Executor whose n-th submit raises, as on shutdown or thread exhaustion."""
+
+    def __init__(self, fail_on):
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.inner = ThreadPoolExecutor(max_workers=8)
+        self.fail_on = fail_on
+        self.count = 0
+
+    def submit(self, fn, *args):
+        self.count += 1
+        if self.count == self.fail_on:
+            raise RuntimeError("submit failed")
+        return self.inner.submit(fn, *args)
+
+
+class PipelinedRestoreDrainTest(unittest.TestCase):
+    """Nothing this operation submitted may still run once it returns."""
+
+    def assert_drained(self, storage, op):
+        self.assertTrue(op.pool_transfers_done)
+        self.assertEqual(storage.active, 0, "a read outlived the operation")
+        self.assertEqual(sorted(storage.calls), sorted(storage.finished))
+
+    def test_kv_error_waits_for_slow_sidecar_of_same_group(self):
+        # The failing group's sidecar is far slower than everything else, so
+        # only an explicit wait on it (not on later groups) can drain it.
+        storage = _Storage(delay=0.01, raise_at=2, sidecar_delay_at={2: 0.3})
+        op = _Op(8)
+        _make(storage, 3)._page_transfer_complete_groups_pipelined(op)
+        self.assertTrue(op.is_terminated())
+        self.assertEqual(op.completed_tokens, 2 * PAGE)
+        self.assertIn(("sidecar", 2), storage.finished)
+        self.assert_drained(storage, op)
+
+    def test_submit_failure_half_way_drains_submitted_reads(self):
+        storage = _Storage(delay=0.2)
+        op = _Op(8)
+        c = _make(storage, 3)
+        c._restore_pool = _FlakyPool(fail_on=4)  # second group's sidecar
+        c._page_transfer_complete_groups_pipelined(op)
+        self.assertTrue(op.is_terminated())
+        self.assertEqual(op.completed_tokens, 0)
+        self.assert_drained(storage, op)
+
+    def test_cancel_mid_flight_publishes_nothing_more_and_drains(self):
+        op = _Op(8)
+        storage = _Storage(delay=0.05,
+                           on_kv=lambda first: first == 2 and op.mark_terminate())
+        _make(storage, 3)._page_transfer_complete_groups_pipelined(op)
+        self.assertLessEqual(op.completed_tokens, 2 * PAGE)
+        self.assertEqual(op.published, sorted(op.published))
+        self.assert_drained(storage, op)
+
+    def test_draft_reads_run_inside_the_drained_group_read(self):
+        storage = _Storage(delay=0.01, raise_at=2)
+        draft_done = []
+        op = _Op(8)
+        c = _make(storage, 3)
+        c.has_draft = True
+
+        def draft(hashes, indices):
+            time.sleep(0.1)
+            draft_done.append(hashes[0])
+
+        c._draft_page_get = draft
+        c._page_transfer_complete_groups_pipelined(op)
+        # Every group whose KV read started also finished its draft read
+        # (the draft read runs first inside the same task) before return.
+        self.assertEqual({int(h[1:]) for h in draft_done}, set(storage.prefixes))
+        self.assert_drained(storage, op)
 
 
 if __name__ == "__main__":

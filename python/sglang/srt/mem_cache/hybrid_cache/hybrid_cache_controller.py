@@ -853,6 +853,7 @@ class HybridCacheController(BaseHiCacheController):
         finished, and the auxiliary worker releases them after we return.
         """
         from collections import deque
+        from concurrent.futures import wait as futures_wait
 
         prefix_keys = operation.prefix_keys
         # The serial path passes the live list, grown after each published
@@ -860,6 +861,10 @@ class HybridCacheController(BaseHiCacheController):
         base_prefix = list(prefix_keys) if prefix_keys else None
         pool = self._restore_executor()
         inflight = deque()
+        # Every future ever submitted for this operation. The publish queue
+        # (``inflight``) drops a group once it is taken for publication, so the
+        # drain in ``finally`` must not rely on it.
+        submitted = []
 
         def read_kv(hashes, indices, group_prefix):
             if self.has_draft:
@@ -895,14 +900,11 @@ class HybridCacheController(BaseHiCacheController):
                 replace(transfer, host_indices=indices, keys=hashes)
                 for transfer in operation.pool_transfers
             ]
-            inflight.append(
-                (
-                    hashes,
-                    transfers,
-                    pool.submit(read_kv, hashes, indices, group_prefix),
-                    pool.submit(read_sidecars, transfers, len(hashes)),
-                )
-            )
+            kv_future = pool.submit(read_kv, hashes, indices, group_prefix)
+            submitted.append(kv_future)
+            sidecar_future = pool.submit(read_sidecars, transfers, len(hashes))
+            submitted.append(sidecar_future)
+            inflight.append((hashes, transfers, kv_future, sidecar_future))
 
         try:
             if operation.is_terminated():
@@ -922,6 +924,10 @@ class HybridCacheController(BaseHiCacheController):
                 if not inflight:
                     break
                 hashes, transfers, kv_future, sidecar_future = inflight.popleft()
+                # Wait for both reads of the group before looking at either
+                # result, so an exception from one cannot leave the other
+                # still writing while we go on.
+                futures_wait((kv_future, sidecar_future))
                 kv_results = kv_future.result()
                 sidecar_results = sidecar_future.result()
                 if operation.is_terminated():
@@ -950,14 +956,11 @@ class HybridCacheController(BaseHiCacheController):
             operation.mark_terminate()
             logger.error("Pipelined complete-group prefetch failed: %s", type(exc).__name__)
         finally:
-            # Reads still in flight write into this operation's host slots;
-            # they must finish before the caller releases the uncommitted tail.
-            for _, _, kv_future, sidecar_future in inflight:
-                for future in (kv_future, sidecar_future):
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
+            # Reads still running write into this operation's host slots; they
+            # must finish before the caller releases the uncommitted tail. Wait
+            # on every submitted future, including the group taken for
+            # publication and any group whose submission raised half-way.
+            futures_wait(submitted)
             operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
